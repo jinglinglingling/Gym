@@ -56,6 +56,7 @@ from responses_api_agents.osworld_agent.runner_registry import DEFAULT_RUNNER_NA
 LOG = logging.getLogger("nemo_gym.osworld_agent")
 
 POINTER_PARALLEL_DISABLED_SENTINEL = "__nemo_gym_parallel_tools_disabled__"
+POINTER_ANTHROPIC_VALIDATION_SENTINEL = "__nemo_gym_anthropic_key_deferred__"
 
 _OSWORLD_LOG_CONTEXT_FIELDS = (
     "run_id",
@@ -201,13 +202,27 @@ def _validate_runner_runtime(config: "OSWorldAgentConfig") -> Optional[str]:
         agent_class_path=config.agent_class_path,
         agent_kwargs=config.agent_kwargs,
     )
-    if runner_spec.kind == "pointer_agent" and not os.environ.get("PARALLEL_API_KEY"):
+    is_pointer = runner_spec.kind == "pointer_agent"
+    if is_pointer and not os.environ.get("PARALLEL_API_KEY"):
         # Pointer constructs its optional Parallel client while importing the
         # module. Match the rollout runtime's no-web-tools mode when no real
         # credential is configured.
         os.environ["PARALLEL_API_KEY"] = POINTER_PARALLEL_DISABLED_SENTINEL
-    if runner_spec.agent_class_path:
-        load_attr(runner_spec.agent_class_path)
+    defer_anthropic_key = (
+        is_pointer
+        and bool(runner_spec.agent_kwargs.get("use_policy_endpoint", True))
+        and not os.environ.get("ANTHROPIC_API_KEY")
+    )
+    if defer_anthropic_key:
+        # Pointer validates this variable at import time, before Gym resolves
+        # the real per-rollout policy credential.
+        os.environ["ANTHROPIC_API_KEY"] = POINTER_ANTHROPIC_VALIDATION_SENTINEL
+    try:
+        if runner_spec.agent_class_path:
+            load_attr(runner_spec.agent_class_path)
+    finally:
+        if defer_anthropic_key and os.environ.get("ANTHROPIC_API_KEY") == POINTER_ANTHROPIC_VALIDATION_SENTINEL:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
     return runner_spec.agent_class_path
 
 

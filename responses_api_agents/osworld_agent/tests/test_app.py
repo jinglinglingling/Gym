@@ -482,12 +482,41 @@ class TestApp:
     @patch("responses_api_agents.osworld_agent.app.load_attr")
     def test_pointer_startup_disables_unconfigured_parallel_tools(self, mock_load_attr, monkeypatch) -> None:
         monkeypatch.delenv("PARALLEL_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        def load_pointer(_path: str) -> None:
+            assert os.environ["ANTHROPIC_API_KEY"] == "__nemo_gym_anthropic_key_deferred__"
+
+        mock_load_attr.side_effect = load_pointer
 
         class_path = _validate_runner_runtime(make_config(runner_name="pointer_agent"))
 
         assert class_path == "mm_agents.pointer.PointerAgent"
         assert os.environ["PARALLEL_API_KEY"] == "__nemo_gym_parallel_tools_disabled__"
+        assert "ANTHROPIC_API_KEY" not in os.environ
         mock_load_attr.assert_called_once_with(class_path)
+
+    @patch("responses_api_agents.osworld_agent.app.load_attr")
+    def test_pointer_startup_does_not_defer_direct_anthropic_key(self, mock_load_attr, monkeypatch) -> None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        def load_pointer(_path: str) -> None:
+            assert "ANTHROPIC_API_KEY" not in os.environ
+
+        mock_load_attr.side_effect = load_pointer
+
+        _validate_runner_runtime(make_config(runner_name="pointer_agent", agent_kwargs={"use_policy_endpoint": False}))
+
+        assert "ANTHROPIC_API_KEY" not in os.environ
+
+    @patch("responses_api_agents.osworld_agent.app.load_attr", side_effect=RuntimeError("broken import"))
+    def test_pointer_startup_restores_deferred_key_after_import_error(self, _mock_load_attr, monkeypatch) -> None:
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        with pytest.raises(RuntimeError, match="broken import"):
+            _validate_runner_runtime(make_config(runner_name="pointer_agent"))
+
+        assert "ANTHROPIC_API_KEY" not in os.environ
 
     def test_metrics_report_binary_and_raw_osworld_scores(self) -> None:
         agent = OSWorldAgent(config=make_config(), server_client=MagicMock(spec=ServerClient))
