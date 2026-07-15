@@ -1143,6 +1143,137 @@ def test_pointer_anthropic_client_options_are_configurable(monkeypatch) -> None:
     )
 
 
+class _PointerResponse:
+    def __init__(self, status_code: int, error_type: str | None = None) -> None:
+        self.status_code = status_code
+        self.error_type = error_type
+        self.closed = False
+
+    def json(self) -> Dict[str, Any]:
+        return {"error": {"type": self.error_type}}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_pointer_budget_retry_targets_only_budget_message_calls(monkeypatch) -> None:
+    clock = SimpleNamespace(now=0.0, sleeps=[])
+
+    def sleep(delay: float) -> None:
+        clock.sleeps.append(delay)
+        clock.now += delay
+
+    monkeypatch.setattr(osworld_client.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(osworld_client.time, "sleep", sleep)
+    monkeypatch.setattr(osworld_client.random, "random", lambda: 0.0)
+    budget = [_PointerResponse(429, "budget_exceeded") for _ in range(2)]
+    success = _PointerResponse(200)
+    responses = iter([*budget, success])
+    retry = osworld_client._pointer_budget_retry("executor", 1000.0)
+    request = SimpleNamespace(url="/v1/messages?beta=true")
+
+    assert retry(request, lambda _request: next(responses)) is success
+    assert clock.sleeps == [30.0, 60.0]
+    assert all(response.closed for response in budget)
+
+    rate_limit = _PointerResponse(429, "rate_limit")
+    assert retry(request, lambda _request: rate_limit) is rate_limit
+    marker = object()
+    count_request = SimpleNamespace(url="/v1/messages/count_tokens?beta=true")
+    assert retry(count_request, lambda _request: marker) is marker
+
+
+@pytest.mark.parametrize(
+    ("error_code", "error_message", "expected_status"),
+    [
+        ("content_length_limit", None, 413),
+        (None, "Content length exceeded 32 MB", 413),
+        ("invalid_model", "Model not found", 400),
+    ],
+)
+def test_pointer_content_length_normalization_matches_anthropic_response_contract(
+    error_code: str | None,
+    error_message: str | None,
+    expected_status: int,
+) -> None:
+    anthropic = pytest.importorskip("anthropic")
+    httpx = pytest.importorskip("httpx")
+    calls = 0
+
+    def handler(request):
+        nonlocal calls
+        calls += 1
+        return httpx.Response(
+            400,
+            json={
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": error_code,
+                    "message": error_message,
+                }
+            },
+            request=request,
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as http_client:
+        client = anthropic.Anthropic(
+            api_key="test-key",  # pragma: allowlist secret
+            base_url="https://inference-api.nvidia.com",
+            max_retries=0,
+            http_client=http_client,
+            middleware=(osworld_client._pointer_budget_retry("executor", float("inf")),),
+        )
+        error_class = anthropic.RequestTooLargeError if expected_status == 413 else anthropic.BadRequestError
+        with pytest.raises(error_class) as raised:
+            client.beta.messages.create(
+                max_tokens=1,
+                messages=[{"role": "user", "content": "hi"}],
+                model="azure/anthropic/claude-sonnet-4-6",
+                betas=[],
+            )
+
+    assert raised.value.status_code == expected_status
+    assert str(expected_status) in str(raised.value)
+    assert calls == 1
+
+
+def test_pointer_budget_retry_stops_at_window_or_task_deadline(monkeypatch) -> None:
+    clock = SimpleNamespace(now=0.0, sleeps=[])
+
+    def sleep(delay: float) -> None:
+        clock.sleeps.append(delay)
+        clock.now += delay
+
+    monkeypatch.setattr(osworld_client.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(osworld_client.time, "sleep", sleep)
+    monkeypatch.setattr(osworld_client.random, "random", lambda: 0.0)
+    request = SimpleNamespace(url="/v1/messages")
+    calls = SimpleNamespace(value=0)
+
+    def budget(_request: Any) -> _PointerResponse:
+        calls.value += 1
+        return _PointerResponse(429, "budget_exceeded")
+
+    with pytest.raises(osworld_client._PointerRetryDeadline, match="quota retry window exhausted"):
+        osworld_client._pointer_budget_retry("planner", 1000.0)(request, budget)
+    assert calls.value == 8
+    assert sum(clock.sleeps) == 900.0
+
+    clock.now = 0.0
+    clock.sleeps.clear()
+    calls.value = 0
+    with pytest.raises(osworld_client._PointerRetryDeadline, match="task deadline"):
+        osworld_client._pointer_budget_retry("planner", 20.0)(request, budget)
+    assert calls.value == 1
+    assert clock.sleeps == [20.0]
+
+    clock.now = 0.0
+    calls.value = 0
+    with pytest.raises(osworld_client._PointerRetryDeadline, match="task deadline"):
+        osworld_client._pointer_budget_retry("planner", 0.0)(request, budget)
+    assert calls.value == 0
+
+
 def test_pointer_anthropic_proxy_logs_schema_v2_request_and_response(tmp_path: Path) -> None:
     class Response:
         def model_dump(self, *, mode: str = "python") -> Dict[str, Any]:
@@ -1279,12 +1410,19 @@ def test_pointer_anthropic_patch_wraps_clients_only_in_logging_context(monkeypat
     monkeypatch.setitem(sys.modules, "mm_agents.pointer.utils", utils_module)
     monkeypatch.setitem(sys.modules, "anthropic", anthropic_module)
 
-    osworld_client._patch_pointer_anthropic_client("https://inference-api.nvidia.com/")
+    osworld_client._patch_pointer_anthropic_client(
+        "https://inference-api.nvidia.com/",
+        deadline_monotonic=1000.0,
+    )
     client = LLMClient()
     unlogged = client._create_client(APIProvider.ANTHROPIC)
     assert isinstance(unlogged, Anthropic)
     assert unlogged.kwargs["base_url"] == "https://inference-api.nvidia.com"
+    assert len(unlogged.kwargs["middleware"]) == 1
     assert client._create_client("other") == ("original", "other")
+    counting = LLMContextManager()._get_counting_client()
+    assert isinstance(counting, Anthropic)
+    assert "middleware" not in counting.kwargs
 
     context = osworld_client._PointerModelIOContext(
         log_path=str(tmp_path / "model-io-agent.jsonl"),
@@ -1300,8 +1438,7 @@ def test_pointer_anthropic_patch_wraps_clients_only_in_logging_context(monkeypat
     assert isinstance(logged, osworld_client._PointerAnthropicClientProxy)
     assert logged.messages.create(model="model", messages=[]) == "response"
     records = [
-        json.loads(line)
-        for line in (tmp_path / "model-io-agent.jsonl").read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in (tmp_path / "model-io-agent.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert [record["event"] for record in records] == ["model_request", "model_response"]
 
@@ -1431,7 +1568,7 @@ def test_pointer_rollout_sets_and_resets_model_io_context(monkeypatch, tmp_path:
     monkeypatch.setattr(
         osworld_client,
         "_patch_pointer_anthropic_client",
-        lambda _base_url: observed_contexts.append(osworld_client._POINTER_MODEL_IO_CONTEXT.get()),
+        lambda _base_url, **_kwargs: observed_contexts.append(osworld_client._POINTER_MODEL_IO_CONTEXT.get()),
     )
 
     result = osworld_client.run_osworld_task(

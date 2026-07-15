@@ -26,8 +26,8 @@ dependencies = [
     # requiring those unrelated repositories.
     "osworld @ https://github.com/xlang-ai/OSWorld/archive/83e8534451ba8b3ab6477448ef3f0a8e563f05be.tar.gz",
     "docker==7.1.0",
-    # Needed by OSWorld's mm_agents.pointer implementation.
-    "anthropic",
+    # Pointer needs Anthropic; retries use the public middleware API in 0.109.2.
+    "anthropic==0.109.2",
     "boto3",
     "parallel-web",
     "requests-toolbelt~=1.0.0",

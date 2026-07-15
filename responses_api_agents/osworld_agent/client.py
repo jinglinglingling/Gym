@@ -26,6 +26,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -47,6 +48,10 @@ _TERMINAL_ACTIONS = {"DONE", "FAIL"}
 
 class _EvaluatorScoreZero(BaseException):
     """Control signal for declarative evaluator setup that proves a zero score."""
+
+
+class _PointerRetryDeadline(BaseException):
+    """Exit Pointer's nested retry loops at the Gym rollout boundary."""
 
 
 @dataclass
@@ -691,6 +696,58 @@ def _pointer_anthropic_client_options(base_url: str, api_key: Optional[str] = No
     }
 
 
+def _pointer_budget_retry(role: str, deadline_monotonic: float) -> Callable[[Any, Callable[[Any], Any]], Any]:
+    """Normalize NVIDIA content limits and retry budget responses within task bounds."""
+
+    def retry(request: Any, call_next: Callable[[Any], Any]) -> Any:
+        if str(request.url).split("?", 1)[0] != "/v1/messages":
+            return call_next(request)
+
+        started = None
+        attempt = 0
+        while True:
+            now = time.monotonic()
+            if now >= deadline_monotonic:
+                raise _PointerRetryDeadline(f"[{role}] Provider request skipped after task deadline.")
+            if started is not None and now >= started + 900.0:
+                raise _PointerRetryDeadline(f"[{role}] Provider quota retry window exhausted.")
+            response = call_next(request)
+            if response.status_code not in {400, 429}:
+                return response
+            try:
+                body = response.json()
+            except Exception:  # noqa: BLE001 - let the SDK handle malformed errors.
+                return response
+            detail = body.get("error") if isinstance(body, Mapping) else None
+            if response.status_code == 400 and isinstance(detail, Mapping):
+                code = str(detail.get("code", "")).lower()
+                message = str(detail.get("message", "")).lower()
+                if code == "content_length_limit" or "content length exceeded" in message:
+                    response.http_response.status_code = 413
+                return response
+            if not isinstance(detail, Mapping) or detail.get("type") != "budget_exceeded":
+                return response
+
+            response.close()
+            now = time.monotonic()
+            started = now if started is None else started
+            stop = min(deadline_monotonic, started + 900.0)
+            if now >= stop:
+                reason = (
+                    "Provider request stopped at task deadline."
+                    if deadline_monotonic <= started + 900.0
+                    else "Provider quota retry window exhausted."
+                )
+                raise _PointerRetryDeadline(f"[{role}] {reason}")
+            cap = min(300.0, 60.0 * (2**attempt))
+            delay = min(cap * (0.5 + random.random() / 2.0), stop - now)
+            LOG.warning("Pointer %s provider budget pause; retrying in %.1fs", role, delay)
+            time.sleep(max(0.0, min(delay, stop - time.monotonic())))
+            attempt += 1
+
+    return retry
+
+
 @dataclass
 class _PointerModelIOContext:
     """Task-scoped destination and identity for Pointer's direct model calls."""
@@ -742,7 +799,9 @@ def _redact_pointer_io_secrets(value: Any) -> Any:
         redacted: Dict[str, Any] = {}
         for key, item in value.items():
             normalized_key = str(key).lower().replace("-", "_")
-            redacted[str(key)] = "<redacted>" if normalized_key in _POINTER_SECRET_KEYS else _redact_pointer_io_secrets(item)
+            redacted[str(key)] = (
+                "<redacted>" if normalized_key in _POINTER_SECRET_KEYS else _redact_pointer_io_secrets(item)
+            )
         return redacted
     if isinstance(value, list):
         return [_redact_pointer_io_secrets(item) for item in value]
@@ -867,7 +926,7 @@ class _PointerMessagesProxy:
             LOG.exception("Failed to serialize Pointer model request for call %s", call_id)
         try:
             response = self._target.create(*args, **kwargs)
-        except Exception as exc:
+        except (Exception, _PointerRetryDeadline) as exc:
             finished_ns = time.time_ns()
             try:
                 _append_pointer_io_event(
@@ -977,7 +1036,7 @@ def _pointer_model_io_context(
     )
 
 
-def _patch_pointer_anthropic_client(base_url: str) -> None:
+def _patch_pointer_anthropic_client(base_url: str, *, deadline_monotonic: float) -> None:
     """Make Pointer's Anthropic SDK client honor the configured base URL."""
 
     if not base_url:
@@ -1001,7 +1060,10 @@ def _patch_pointer_anthropic_client(base_url: str) -> None:
         if provider == pointer_utils.APIProvider.ANTHROPIC:
             from anthropic import Anthropic  # noqa: PLC0415
 
-            client = Anthropic(**_pointer_anthropic_client_options(base_url, self.api_key))
+            client = Anthropic(
+                **_pointer_anthropic_client_options(base_url, self.api_key),
+                middleware=(_pointer_budget_retry(str(getattr(self, "name", "pointer")), deadline_monotonic),),
+            )
             context = _POINTER_MODEL_IO_CONTEXT.get()
             if context is None:
                 return client
@@ -1779,7 +1841,10 @@ def run_osworld_task(
             agent_cls = load_attr(runner_spec.agent_class_path)
             _sync_pointer_config(policy_model_name)
             _patch_pointer_optional_parallel_tools(disable_parallel_tools)
-            _patch_pointer_anthropic_client(anthropic_base_url)
+            _patch_pointer_anthropic_client(
+                anthropic_base_url,
+                deadline_monotonic=task_start + task_timeout,
+            )
             pointer_agent = agent_cls(
                 env=env,
                 screen_size=screen_size,
@@ -1928,7 +1993,7 @@ def run_osworld_task(
                     model_text = model_fn(system_prompt, instruction, history_window + [obs_entry])
                     model_text = strip_thinking(model_text or "")
                     actions = parse_actions(model_text)
-            except Exception as exc:  # noqa: BLE001 — record + abort, don't crash the VM.
+            except (Exception, _PointerRetryDeadline) as exc:  # noqa: BLE001 — record + abort, don't crash the VM.
                 error = f"agent/model call failed at step {step_idx}: {exc}"
                 task_logger.exception("Agent/model call failed at step %d", step_idx)
                 steps.append(StepRecord(step=step_idx, model_text="", actions=[], reward=0.0, done=False))
