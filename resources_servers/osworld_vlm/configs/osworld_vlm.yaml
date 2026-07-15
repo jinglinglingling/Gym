@@ -1,0 +1,55 @@
+osworld_vlm:
+  resources_servers:
+    osworld_vlm:
+      entrypoint: app.py
+      domain: agent
+      description: OSWorld desktop benchmark environment
+      value: Improve online desktop task completion
+      provider_name: ${oc.env:OSWORLD_PROVIDER_NAME,apptainer}
+      # VM base disk path must point to a qcow2 image, not the apptainer SIF/sqsh.
+      path_to_vm: ${oc.env:OSWORLD_VM_PATH,null}
+      snapshot_name: ${oc.env:OSWORLD_SNAPSHOT_NAME,init_state}
+      action_space: pyautogui
+      cache_dir: ${oc.env:OSWORLD_CACHE_DIR,cache}
+      headless: true
+      require_a11y_tree: true
+      require_terminal: false
+      os_type: Ubuntu
+      enable_proxy: ${oc.decode:${oc.env:OSWORLD_ENABLE_PROXY,false}}
+      client_password: ${oc.env:OSWORLD_CLIENT_PASSWORD,password}
+      region: ${oc.env:OSWORLD_REGION,null}
+      screen_width: ${oc.decode:${oc.env:SCREEN_WIDTH,1920}}
+      screen_height: ${oc.decode:${oc.env:SCREEN_HEIGHT,1080}}
+      default_max_steps: ${oc.decode:${oc.env:OSWORLD_NEMOGYM_MAX_STEPS,15}}
+      step_pause_seconds: ${oc.decode:${oc.env:OSWORLD_NEMOGYM_STEP_PAUSE,1.5}}
+      max_a11y_chars: ${oc.decode:${oc.env:OSWORLD_NEMOGYM_MAX_A11Y_CHARS,12000}}
+      max_terminal_chars: ${oc.decode:${oc.env:OSWORLD_NEMOGYM_MAX_TERMINAL_CHARS,8000}}
+      test_config_base_dir: ${oc.env:OSWORLD_TEST_CONFIG_BASE_DIR,evaluation_examples}
+      trace_dir: ${oc.env:OSWORLD_TRACE_DIR,null}
+      initial_observation_timeout_seconds: ${oc.decode:${oc.env:OSWORLD_INITIAL_OBSERVATION_TIMEOUT,60}}
+      initial_observation_poll_seconds: ${oc.decode:${oc.env:OSWORLD_INITIAL_OBSERVATION_POLL_SECONDS,2}}
+      initial_observation_min_nonblack_ratio: ${oc.decode:${oc.env:OSWORLD_INITIAL_OBSERVATION_MIN_NONBLACK_RATIO,0.001}}
+
+osworld_vlm_agent:
+  responses_api_agents:
+    osworld_vlm_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: osworld_vlm
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      max_steps: ${oc.decode:${oc.env:OSWORLD_NEMOGYM_AGENT_MAX_STEPS,20}}
+      max_image_side: ${oc.decode:${oc.env:OSWORLD_VLM_MAX_IMAGE_SIDE,1024}}
+      image_detail: high
+      strip_images_from_output: ${oc.decode:${oc.env:OSWORLD_NEMOGYM_STRIP_IMAGES_FROM_OUTPUT,true}}
+      datasets:
+        - name: train
+          type: train
+          jsonl_fpath: data/nemogym/osworld_online_train.jsonl
+          license: Apache 2.0
+        - name: validation
+          type: validation
+          jsonl_fpath: data/nemogym/osworld_online_val.jsonl
+          license: Apache 2.0

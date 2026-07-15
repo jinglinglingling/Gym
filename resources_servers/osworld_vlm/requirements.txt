@@ -1,0 +1,13 @@
+-e nemo-gym[dev] @ ../../
+gymnasium~=0.28.1
+playwright
+PyDrive
+requests-toolbelt
+python-dotenv
+beautifulsoup4
+cssselect
+lxml
+openpyxl
+rapidfuzz
+tldextract
+xmltodict
