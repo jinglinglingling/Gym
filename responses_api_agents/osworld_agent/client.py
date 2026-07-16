@@ -45,6 +45,25 @@ LOG = logging.getLogger("nemo_gym.osworld_agent.client")
 # Sentinel actions OSWorld recognises in step().
 _TERMINAL_ACTIONS = {"DONE", "FAIL"}
 
+_SCREEN_LOCK_PREFLIGHT_OK = "OSWORLD_SCREEN_LOCK_PREFLIGHT_OK"
+_SCREEN_LOCK_PREFLIGHT_SCRIPT = rf"""
+set -eu
+
+runtime_dir="${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}"
+bus_path="$runtime_dir/bus"
+test -S "$bus_path" || {{ echo "user DBus socket not found: $bus_path" >&2; exit 20; }}
+export XDG_RUNTIME_DIR="$runtime_dir"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path"
+
+command -v gsettings >/dev/null 2>&1 || {{ echo "gsettings is unavailable" >&2; exit 21; }}
+gsettings set org.gnome.desktop.session idle-delay 'uint32 0'
+gsettings set org.gnome.desktop.screensaver lock-enabled false
+test "$(gsettings get org.gnome.desktop.session idle-delay)" = 'uint32 0'
+test "$(gsettings get org.gnome.desktop.screensaver lock-enabled)" = 'false'
+
+echo "{_SCREEN_LOCK_PREFLIGHT_OK}"
+"""
+
 
 class _EvaluatorScoreZero(BaseException):
     """Control signal for declarative evaluator setup that proves a zero score."""
@@ -52,6 +71,10 @@ class _EvaluatorScoreZero(BaseException):
 
 class _PointerRetryDeadline(BaseException):
     """Exit Pointer's nested retry loops at the Gym rollout boundary."""
+
+    def __init__(self, message: str, *, task_deadline: bool = False) -> None:
+        super().__init__(message)
+        self.task_deadline = task_deadline
 
 
 @dataclass
@@ -165,6 +188,27 @@ def _merge_consecutive_pyautogui_actions(actions: List[Any]) -> List[Any]:
     if pending:
         merged.append("\n".join(pending))
     return merged
+
+
+def _disable_guest_screen_lock(controller: Any, logger: logging.Logger) -> None:
+    """Disable and verify guest idle locking using the logged-in user session."""
+
+    run_bash_script = getattr(controller, "run_bash_script", None)
+    if not callable(run_bash_script):
+        raise RuntimeError("OSWorld controller has no run_bash_script support for the screen-lock preflight")
+
+    result = run_bash_script(_SCREEN_LOCK_PREFLIGHT_SCRIPT, timeout=20)
+    if not isinstance(result, Mapping):
+        raise RuntimeError(f"screen-lock preflight returned an invalid response: {result!r}")
+
+    output = str(result.get("output") or "").strip()
+    error_output = str(result.get("error") or "").strip()
+    returncode = result.get("returncode")
+    if returncode != 0 or _SCREEN_LOCK_PREFLIGHT_OK not in output.splitlines():
+        detail = error_output or output or "no guest output"
+        raise RuntimeError(f"screen-lock preflight failed (returncode={returncode!r}): {detail}")
+
+    logger.info("Guest screen-lock preflight passed")
 
 
 def _model_response_content(response: Any) -> str:
@@ -355,6 +399,82 @@ def _patch_setup_execute_contract() -> None:
 
     execute_setup._nemo_gym_returncode_contract = True  # type: ignore[attr-defined]
     controller_class._execute_setup = execute_setup
+
+
+def _patch_chrome_setup_cdp_lifecycle() -> None:
+    """Backport tab setup lifecycle fixes when the installed OSWorld lacks them."""
+
+    try:
+        from desktop_env.controllers import setup as setup_module  # type: ignore
+    except Exception:  # noqa: BLE001 - OSWorld is optional outside the runtime.
+        return
+
+    setup_logger = getattr(setup_module, "logger", None)
+    if isinstance(setup_logger, logging.Logger) and setup_logger.getEffectiveLevel() < logging.INFO:
+        setup_logger.setLevel(logging.INFO)
+
+    controller_class = setup_module.SetupController
+    open_tabs = controller_class._chrome_open_tabs_setup
+    close_tabs = controller_class._chrome_close_tabs_setup
+    if callable(getattr(setup_module, "_connect_chrome_over_cdp", None)) or (
+        getattr(open_tabs, "_nemo_gym_cdp_lifecycle", False) and getattr(close_tabs, "_nemo_gym_cdp_lifecycle", False)
+    ):
+        return
+
+    def connect_with_retry(playwright: Any, remote_debugging_url: str) -> Any:
+        for attempt in range(15):
+            try:
+                return playwright.chromium.connect_over_cdp(remote_debugging_url, timeout=30_000)
+            except Exception as exc:  # noqa: BLE001 - preserve upstream retry behavior.
+                if attempt == 14:
+                    raise
+                setup_module.logger.error("CDP connection attempt %d failed: %s", attempt + 1, exc)
+                setup_module.time.sleep(5)
+
+    def open_tabs_setup(self: Any, urls_to_open: List[str]) -> None:
+        remote_debugging_url = f"http://{self.vm_ip}:{self.chromium_port}"
+        setup_module.logger.info("Connect to Chrome @: %s", remote_debugging_url)
+
+        with setup_module.sync_playwright() as playwright:
+            browser = connect_with_retry(playwright, remote_debugging_url)
+            if not browser:
+                return
+            try:
+                setup_module.logger.info("Opening %s...", urls_to_open)
+                context = browser.contexts[0]
+                for index, url in enumerate(urls_to_open):
+                    page = context.new_page()
+                    try:
+                        page.goto(url, timeout=60000, wait_until="commit")
+                    except Exception:  # noqa: BLE001 - a slow site must not abort task setup.
+                        setup_module.logger.warning("Opening %s exceeds time limit", url)
+                    if index == 0:
+                        context.pages[0].close()
+            finally:
+                browser.close()
+
+    def close_tabs_setup(self: Any, urls_to_close: List[str]) -> None:
+        setup_module.time.sleep(5)
+        remote_debugging_url = f"http://{self.vm_ip}:{self.chromium_port}"
+
+        with setup_module.sync_playwright() as playwright:
+            browser = connect_with_retry(playwright, remote_debugging_url)
+            if not browser:
+                return
+            try:
+                context = browser.contexts[0]
+                for url in urls_to_close:
+                    for page in context.pages:
+                        if setup_module.compare_urls(page.url, url):
+                            page.close()
+                            break
+            finally:
+                browser.close()
+
+    open_tabs_setup._nemo_gym_cdp_lifecycle = True  # type: ignore[attr-defined]
+    close_tabs_setup._nemo_gym_cdp_lifecycle = True  # type: ignore[attr-defined]
+    controller_class._chrome_open_tabs_setup = open_tabs_setup
+    controller_class._chrome_close_tabs_setup = close_tabs_setup
 
 
 def _configure_docker_port_lock_timeout(timeout: float) -> None:
@@ -708,7 +828,10 @@ def _pointer_budget_retry(role: str, deadline_monotonic: float) -> Callable[[Any
         while True:
             now = time.monotonic()
             if now >= deadline_monotonic:
-                raise _PointerRetryDeadline(f"[{role}] Provider request skipped after task deadline.")
+                raise _PointerRetryDeadline(
+                    f"[{role}] Provider request skipped after task deadline.",
+                    task_deadline=True,
+                )
             if started is not None and now >= started + 900.0:
                 raise _PointerRetryDeadline(f"[{role}] Provider quota retry window exhausted.")
             response = call_next(request)
@@ -738,7 +861,10 @@ def _pointer_budget_retry(role: str, deadline_monotonic: float) -> Callable[[Any
                     if deadline_monotonic <= started + 900.0
                     else "Provider quota retry window exhausted."
                 )
-                raise _PointerRetryDeadline(f"[{role}] {reason}")
+                raise _PointerRetryDeadline(
+                    f"[{role}] {reason}",
+                    task_deadline=deadline_monotonic <= started + 900.0,
+                )
             cap = min(300.0, 60.0 * (2**attempt))
             delay = min(cap * (0.5 + random.random() / 2.0), stop - now)
             LOG.warning("Pointer %s provider budget pause; retrying in %.1fs", role, delay)
@@ -1170,7 +1296,7 @@ def _setup_task_artifacts(
         for logger_name in ("nemo_gym.osworld_agent", "desktopenv", "desktop_env", "mm_agents"):
             artifact_logger = logging.getLogger(logger_name)
             attached_loggers.append((artifact_logger, artifact_logger.level))
-            artifact_logger.setLevel(logging.DEBUG)
+            artifact_logger.setLevel(logging.INFO if logger_name in {"desktopenv", "desktop_env"} else logging.DEBUG)
             artifact_logger.addHandler(worker_handler)
             if logger_name == "nemo_gym.osworld_agent":
                 artifact_logger.addHandler(runtime_handler)
@@ -1580,6 +1706,7 @@ def run_osworld_task(
     )
     env_cls = load_attr(runner_spec.env_class_path)
     _patch_setup_execute_contract()
+    _patch_chrome_setup_cdp_lifecycle()
     if provider_name == "docker":
         _configure_docker_port_lock_timeout(docker_port_lock_timeout)
     instruction = task_config.get("instruction", "")
@@ -1666,6 +1793,7 @@ def run_osworld_task(
                 "Linked %d pre-staged setup cache entries for task %s", linked_cache_files, _safe_task_id(task_config)
             )
         env.reset(task_config=task_config)
+        _disable_guest_screen_lock(env.controller, task_logger)
         native_agent = None
         pointer_agent = None
         pointer_log_handler: Optional[logging.Handler] = None
@@ -1994,6 +2122,8 @@ def run_osworld_task(
                     model_text = strip_thinking(model_text or "")
                     actions = parse_actions(model_text)
             except (Exception, _PointerRetryDeadline) as exc:  # noqa: BLE001 — record + abort, don't crash the VM.
+                if isinstance(exc, _PointerRetryDeadline) and exc.task_deadline:
+                    timed_out = True
                 error = f"agent/model call failed at step {step_idx}: {exc}"
                 task_logger.exception("Agent/model call failed at step %d", step_idx)
                 steps.append(StepRecord(step=step_idx, model_text="", actions=[], reward=0.0, done=False))

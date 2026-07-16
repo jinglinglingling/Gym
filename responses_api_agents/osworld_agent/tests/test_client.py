@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, Dict, List
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -23,6 +24,7 @@ class FakeController:
     def __init__(self) -> None:
         self.started = 0
         self.ended_paths: List[str] = []
+        self.bash_scripts: List[Dict[str, Any]] = []
 
     def start_recording(self) -> None:
         self.started += 1
@@ -31,6 +33,15 @@ class FakeController:
     def end_recording(self, path: str) -> None:
         self.ended_paths.append(path)
         return None
+
+    def run_bash_script(self, script: str, timeout: int = 30) -> Dict[str, Any]:
+        self.bash_scripts.append({"script": script, "timeout": timeout})
+        return {
+            "status": "success",
+            "output": osworld_client._SCREEN_LOCK_PREFLIGHT_OK,
+            "error": "",
+            "returncode": 0,
+        }
 
 
 class FakeEnv:
@@ -329,6 +340,63 @@ def test_gym_policy_runner_preserves_existing_pyautogui_flow(monkeypatch) -> Non
     assert FakeEnv.instances[0].actions == ["DONE"]
 
 
+def test_guest_screen_lock_preflight_uses_existing_session_and_verifies_settings() -> None:
+    controller = FakeController()
+    osworld_client._disable_guest_screen_lock(controller, osworld_client.LOG)
+
+    script = osworld_client._SCREEN_LOCK_PREFLIGHT_SCRIPT
+    assert 'DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path"' in script
+    assert "gsettings set org.gnome.desktop.session idle-delay 'uint32 0'" in script
+    assert "gsettings set org.gnome.desktop.screensaver lock-enabled false" in script
+    assert controller.bash_scripts == [{"script": script, "timeout": 20}]
+
+
+def test_guest_screen_lock_preflight_rejects_unverified_result() -> None:
+    controller = FakeController()
+    controller.run_bash_script = lambda script, timeout: {
+        "status": "error",
+        "output": "",
+        "error": "failed to verify idle-delay",
+        "returncode": 22,
+    }
+
+    with pytest.raises(RuntimeError, match="failed to verify idle-delay"):
+        osworld_client._disable_guest_screen_lock(controller, osworld_client.LOG)
+
+
+def test_guest_screen_lock_preflight_failure_aborts_before_pointer_starts(monkeypatch, tmp_path) -> None:
+    _patch_client_for_fake_runtime(monkeypatch)
+    monkeypatch.setenv("OSWORLD_POINTER_RESULTS_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        FakeController,
+        "run_bash_script",
+        lambda self, script, timeout=30: {
+            "status": "error",
+            "output": "",
+            "error": "DBus user session is unavailable",
+            "returncode": 20,
+        },
+    )
+
+    result = osworld_client.run_osworld_task(
+        {"id": "task-screen-lock-preflight", "instruction": "Use Pointer."},
+        model_fn=lambda *_args: pytest.fail("model must not run"),
+        runner_name="pointer_agent",
+        env_class_path="fake.FakeEnv",
+        agent_class_path="fake.FakePointerAgent",
+        policy_base_url="https://inference-api.nvidia.com",
+        policy_api_key="test-key",  # pragma: allowlist secret
+        policy_model_name="azure/anthropic/claude-opus-4-7",
+        sleep_after_execution=0,
+        task_timeout=10,
+    )
+
+    assert result.mask_sample is True
+    assert result.finished is False
+    assert "DBus user session is unavailable" in (result.error or "")
+    assert FakePointerAgent.instances == []
+
+
 def test_raw_reward_mode_preserves_partial_osworld_score(monkeypatch) -> None:
     _patch_client_for_fake_runtime(monkeypatch)
     monkeypatch.setattr(FakeEnv, "evaluate", lambda _self: 0.4)
@@ -460,6 +528,43 @@ def test_task_artifacts_capture_logs_trajectory_screenshots_and_result(monkeypat
     assert result_payload["termination_reason"] == "agent_done"
     assert "Starting OSWorld rollout" in (artifact_dir / "worker.log").read_text(encoding="utf-8")
     assert "Starting OSWorld rollout" in (artifact_dir / "runtime.log").read_text(encoding="utf-8")
+
+
+def test_task_artifacts_do_not_enable_or_capture_upstream_debug(monkeypatch, tmp_path: Path) -> None:
+    _patch_client_for_fake_runtime(monkeypatch)
+    monkeypatch.setenv("OSWORLD_TASK_ARTIFACT_ROOT", str(tmp_path))
+    upstream_logger = osworld_client.logging.getLogger("desktopenv.setup")
+    previous_level = upstream_logger.level
+    observed: Dict[str, bool] = {}
+
+    def preflight_with_upstream_logs(self, script, timeout=30):
+        observed["debug_enabled"] = upstream_logger.isEnabledFor(osworld_client.logging.DEBUG)
+        upstream_logger.debug("UPSTREAM_DEBUG_MARKER")
+        upstream_logger.info("UPSTREAM_INFO_MARKER")
+        return {
+            "status": "success",
+            "output": osworld_client._SCREEN_LOCK_PREFLIGHT_OK,
+            "error": "",
+            "returncode": 0,
+        }
+
+    upstream_logger.setLevel(osworld_client.logging.NOTSET)
+    monkeypatch.setattr(FakeController, "run_bash_script", preflight_with_upstream_logs)
+    try:
+        result = osworld_client.run_osworld_task(
+            {"id": "artifact-log-levels", "instruction": "Finish the task."},
+            model_fn=lambda _system, _instruction, _history: "```DONE```",
+            env_class_path="fake.FakeEnv",
+            sleep_after_execution=0,
+            task_timeout=10,
+        )
+    finally:
+        upstream_logger.setLevel(previous_level)
+
+    worker_log = (Path(result.artifact_dir or "") / "worker.log").read_text(encoding="utf-8")
+    assert observed == {"debug_enabled": False}
+    assert "UPSTREAM_INFO_MARKER" in worker_log
+    assert "UPSTREAM_DEBUG_MARKER" not in worker_log
 
 
 def test_task_artifact_directory_is_collision_safe(monkeypatch, tmp_path: Path) -> None:
@@ -619,6 +724,35 @@ def test_pointer_agent_runner_uses_native_pointer_predict_loop(monkeypatch, tmp_
     assert pointer.predict_calls == 1
     assert pointer.log_usage_calls == 1
     assert (Path(pointer.reset_calls[0]["task_results_dir"]) / "pointer.log").exists()
+
+
+def test_pointer_task_deadline_is_reported_as_timeout(monkeypatch, tmp_path) -> None:
+    _patch_client_for_fake_runtime(monkeypatch)
+    monkeypatch.setenv("OSWORLD_POINTER_RESULTS_DIR", str(tmp_path))
+
+    def hit_task_deadline(_self, _obs):
+        raise osworld_client._PointerRetryDeadline(
+            "[executor] Provider request skipped after task deadline.",
+            task_deadline=True,
+        )
+
+    monkeypatch.setattr(FakePointerAgent, "predict", hit_task_deadline)
+    result = osworld_client.run_osworld_task(
+        {"id": "task-pointer-deadline", "instruction": "Use Pointer."},
+        model_fn=lambda *_args: pytest.fail("model must not run"),
+        runner_name="pointer_agent",
+        env_class_path="fake.FakeEnv",
+        agent_class_path="fake.FakePointerAgent",
+        policy_base_url="https://inference-api.nvidia.com",
+        policy_api_key="test-key",  # pragma: allowlist secret
+        policy_model_name="azure/anthropic/claude-opus-4-7",
+        sleep_after_execution=0,
+        task_timeout=10,
+    )
+
+    assert result.mask_sample is True
+    assert result.termination_reason == "timeout"
+    assert "task deadline" in (result.error or "")
 
 
 def test_m3_agent_runner_uses_messages_endpoint_and_native_predict_loop(monkeypatch, tmp_path) -> None:
@@ -890,6 +1024,111 @@ def test_setup_on_nonzero_score_zero_is_a_valid_evaluator_outcome(monkeypatch, t
         osworld_client.logging.getLogger("test-evaluator"),
         disable_gpu=False,
     ) == pytest.approx(0.0)
+
+
+def _install_fake_chrome_setup_module(
+    monkeypatch,
+    *,
+    pages: List[Any] | None = None,
+    upstream_cdp_helper: bool = False,
+):
+    desktop_env = ModuleType("desktop_env")
+    controllers = ModuleType("desktop_env.controllers")
+    setup_module = ModuleType("desktop_env.controllers.setup")
+    context = MagicMock()
+    context.pages = pages or [MagicMock(url="about:blank")]
+    browser = MagicMock()
+    browser.contexts = [context]
+    playwright = MagicMock()
+    playwright.chromium.connect_over_cdp.return_value = browser
+    playwright_context = MagicMock()
+    playwright_context.__enter__.return_value = playwright
+
+    class SetupController:
+        vm_ip = "127.0.0.1"
+        chromium_port = 9223
+
+        def _chrome_open_tabs_setup(self, _urls):
+            raise AssertionError("unpatched open-tabs setup called")
+
+        def _chrome_close_tabs_setup(self, _urls):
+            raise AssertionError("unpatched close-tabs setup called")
+
+    setup_module.SetupController = SetupController
+    setup_module.sync_playwright = MagicMock(return_value=playwright_context)
+    setup_module.compare_urls = lambda actual, expected: actual == expected
+    setup_module.time = SimpleNamespace(sleep=lambda _seconds: None)
+    setup_module.logger = osworld_client.logging.getLogger("desktopenv.setup.fake")
+    setup_module.logger.setLevel(osworld_client.logging.DEBUG)
+    if upstream_cdp_helper:
+        setup_module._connect_chrome_over_cdp = MagicMock()
+    controllers.setup = setup_module
+    desktop_env.controllers = controllers
+    monkeypatch.setitem(sys.modules, "desktop_env", desktop_env)
+    monkeypatch.setitem(sys.modules, "desktop_env.controllers", controllers)
+    monkeypatch.setitem(sys.modules, "desktop_env.controllers.setup", setup_module)
+    return SetupController, browser, context, playwright
+
+
+def test_chrome_setup_cdp_patch_uses_commit_and_detaches_after_slow_navigation(monkeypatch) -> None:
+    blank_page = MagicMock(url="about:blank")
+    pages = [MagicMock(), MagicMock(), MagicMock()]
+    pages[1].goto.side_effect = RuntimeError("navigation timed out")
+    controller_class, browser, context, playwright = _install_fake_chrome_setup_module(monkeypatch, pages=[blank_page])
+    context.new_page.side_effect = pages
+
+    osworld_client._patch_chrome_setup_cdp_lifecycle()
+    patched_method = controller_class._chrome_open_tabs_setup
+    osworld_client._patch_chrome_setup_cdp_lifecycle()
+    urls = ["https://www.lonelyplanet.com", "https://www.airbnb.com", "https://www.tripadvisor.com"]
+    controller_class()._chrome_open_tabs_setup(urls)
+
+    assert controller_class._chrome_open_tabs_setup is patched_method
+    assert not osworld_client.logging.getLogger("desktopenv.setup.fake").isEnabledFor(osworld_client.logging.DEBUG)
+    for page, url in zip(pages, urls):
+        page.goto.assert_called_once_with(url, timeout=60000, wait_until="commit")
+    blank_page.close.assert_called_once_with()
+    playwright.chromium.connect_over_cdp.assert_called_once_with("http://127.0.0.1:9223", timeout=30_000)
+    browser.close.assert_called_once_with()
+
+
+def test_chrome_setup_cdp_patch_preserves_newer_upstream_implementation(monkeypatch) -> None:
+    controller_class, _, _, _ = _install_fake_chrome_setup_module(monkeypatch, upstream_cdp_helper=True)
+    open_tabs = controller_class._chrome_open_tabs_setup
+    close_tabs = controller_class._chrome_close_tabs_setup
+
+    osworld_client._patch_chrome_setup_cdp_lifecycle()
+
+    assert controller_class._chrome_open_tabs_setup is open_tabs
+    assert controller_class._chrome_close_tabs_setup is close_tabs
+
+
+def test_chrome_setup_cdp_patch_closes_matching_tab_and_detaches(monkeypatch) -> None:
+    tripadvisor_url = "https://www.tripadvisor.com"
+    airbnb_page = MagicMock(url="https://www.airbnb.com")
+    tripadvisor_page = MagicMock(url=tripadvisor_url)
+    controller_class, browser, _, _ = _install_fake_chrome_setup_module(
+        monkeypatch, pages=[airbnb_page, tripadvisor_page]
+    )
+
+    osworld_client._patch_chrome_setup_cdp_lifecycle()
+    controller_class()._chrome_close_tabs_setup([tripadvisor_url])
+
+    airbnb_page.close.assert_not_called()
+    tripadvisor_page.close.assert_called_once_with()
+    browser.close.assert_called_once_with()
+
+
+def test_chrome_setup_cdp_patch_detaches_when_tab_close_raises(monkeypatch) -> None:
+    page = MagicMock(url="https://example.test/failing-close")
+    page.close.side_effect = RuntimeError("page close failed")
+    controller_class, browser, _, _ = _install_fake_chrome_setup_module(monkeypatch, pages=[page])
+
+    osworld_client._patch_chrome_setup_cdp_lifecycle()
+    with pytest.raises(RuntimeError, match="page close failed"):
+        controller_class()._chrome_close_tabs_setup([page.url])
+
+    browser.close.assert_called_once_with()
 
 
 def test_docker_port_lock_timeout_is_configurable(monkeypatch) -> None:
@@ -1254,16 +1493,18 @@ def test_pointer_budget_retry_stops_at_window_or_task_deadline(monkeypatch) -> N
         calls.value += 1
         return _PointerResponse(429, "budget_exceeded")
 
-    with pytest.raises(osworld_client._PointerRetryDeadline, match="quota retry window exhausted"):
+    with pytest.raises(osworld_client._PointerRetryDeadline, match="quota retry window exhausted") as quota_deadline:
         osworld_client._pointer_budget_retry("planner", 1000.0)(request, budget)
+    assert quota_deadline.value.task_deadline is False
     assert calls.value == 8
     assert sum(clock.sleeps) == 900.0
 
     clock.now = 0.0
     clock.sleeps.clear()
     calls.value = 0
-    with pytest.raises(osworld_client._PointerRetryDeadline, match="task deadline"):
+    with pytest.raises(osworld_client._PointerRetryDeadline, match="task deadline") as task_deadline:
         osworld_client._pointer_budget_retry("planner", 20.0)(request, budget)
+    assert task_deadline.value.task_deadline is True
     assert calls.value == 1
     assert clock.sleeps == [20.0]
 
