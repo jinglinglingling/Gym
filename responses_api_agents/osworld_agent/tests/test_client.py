@@ -34,8 +34,8 @@ class FakeController:
         self.ended_paths.append(path)
         return None
 
-    def run_bash_script(self, script: str, timeout: int = 30) -> Dict[str, Any]:
-        self.bash_scripts.append({"script": script, "timeout": timeout})
+    def _execute_setup(self, command: List[str], **kwargs: Any) -> Dict[str, Any]:
+        self.bash_scripts.append({"command": command, **kwargs})
         return {
             "status": "success",
             "output": osworld_client._SCREEN_LOCK_PREFLIGHT_OK,
@@ -50,6 +50,7 @@ class FakeEnv:
     def __init__(self, **kwargs: Any) -> None:
         self.kwargs = kwargs
         self.controller = FakeController()
+        self.setup_controller = self.controller
         self.vm_ip = "127.0.0.1"
         self.actions: List[Any] = []
         FakeEnv.instances.append(self)
@@ -348,12 +349,17 @@ def test_guest_screen_lock_preflight_uses_existing_session_and_verifies_settings
     assert 'DBUS_SESSION_BUS_ADDRESS="unix:path=$bus_path"' in script
     assert "gsettings set org.gnome.desktop.session idle-delay 'uint32 0'" in script
     assert "gsettings set org.gnome.desktop.screensaver lock-enabled false" in script
-    assert controller.bash_scripts == [{"script": script, "timeout": 20}]
+    assert controller.bash_scripts == [
+        {
+            "command": ["/bin/bash", "-lc", script],
+            "expected_returncodes": [0],
+        }
+    ]
 
 
 def test_guest_screen_lock_preflight_rejects_unverified_result() -> None:
     controller = FakeController()
-    controller.run_bash_script = lambda script, timeout: {
+    controller._execute_setup = lambda command, **kwargs: {
         "status": "error",
         "output": "",
         "error": "failed to verify idle-delay",
@@ -369,8 +375,8 @@ def test_guest_screen_lock_preflight_failure_aborts_before_pointer_starts(monkey
     monkeypatch.setenv("OSWORLD_POINTER_RESULTS_DIR", str(tmp_path))
     monkeypatch.setattr(
         FakeController,
-        "run_bash_script",
-        lambda self, script, timeout=30: {
+        "_execute_setup",
+        lambda self, command, **kwargs: {
             "status": "error",
             "output": "",
             "error": "DBus user session is unavailable",
@@ -537,7 +543,7 @@ def test_task_artifacts_do_not_enable_or_capture_upstream_debug(monkeypatch, tmp
     previous_level = upstream_logger.level
     observed: Dict[str, bool] = {}
 
-    def preflight_with_upstream_logs(self, script, timeout=30):
+    def preflight_with_upstream_logs(self, command, **kwargs):
         observed["debug_enabled"] = upstream_logger.isEnabledFor(osworld_client.logging.DEBUG)
         upstream_logger.debug("UPSTREAM_DEBUG_MARKER")
         upstream_logger.info("UPSTREAM_INFO_MARKER")
@@ -549,7 +555,7 @@ def test_task_artifacts_do_not_enable_or_capture_upstream_debug(monkeypatch, tmp
         }
 
     upstream_logger.setLevel(osworld_client.logging.NOTSET)
-    monkeypatch.setattr(FakeController, "run_bash_script", preflight_with_upstream_logs)
+    monkeypatch.setattr(FakeController, "_execute_setup", preflight_with_upstream_logs)
     try:
         result = osworld_client.run_osworld_task(
             {"id": "artifact-log-levels", "instruction": "Finish the task."},

@@ -190,14 +190,17 @@ def _merge_consecutive_pyautogui_actions(actions: List[Any]) -> List[Any]:
     return merged
 
 
-def _disable_guest_screen_lock(controller: Any, logger: logging.Logger) -> None:
+def _disable_guest_screen_lock(setup_controller: Any, logger: logging.Logger) -> None:
     """Disable and verify guest idle locking using the logged-in user session."""
 
-    run_bash_script = getattr(controller, "run_bash_script", None)
-    if not callable(run_bash_script):
-        raise RuntimeError("OSWorld controller has no run_bash_script support for the screen-lock preflight")
+    execute_setup = getattr(setup_controller, "_execute_setup", None)
+    if not callable(execute_setup):
+        raise RuntimeError("OSWorld setup controller cannot execute the screen-lock preflight")
 
-    result = run_bash_script(_SCREEN_LOCK_PREFLIGHT_SCRIPT, timeout=20)
+    result = execute_setup(
+        ["/bin/bash", "-lc", _SCREEN_LOCK_PREFLIGHT_SCRIPT],
+        expected_returncodes=[0],
+    )
     if not isinstance(result, Mapping):
         raise RuntimeError(f"screen-lock preflight returned an invalid response: {result!r}")
 
@@ -1793,7 +1796,7 @@ def run_osworld_task(
                 "Linked %d pre-staged setup cache entries for task %s", linked_cache_files, _safe_task_id(task_config)
             )
         env.reset(task_config=task_config)
-        _disable_guest_screen_lock(env.controller, task_logger)
+        _disable_guest_screen_lock(env.setup_controller, task_logger)
         native_agent = None
         pointer_agent = None
         pointer_log_handler: Optional[logging.Handler] = None
