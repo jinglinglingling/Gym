@@ -169,6 +169,17 @@ def setup_env_command(dir_path: Path, global_config_dict: DictConfig, prefix: st
         prefix_cmd = f" > >(sed 's/^/({prefix}) /') 2> >(sed 's/^/({prefix}) /' >&2)"
         env_setup_cmd = f"{uv_venv_cmd}{prefix_cmd} && source {venv_activate_fpath} && {install_cmd}{prefix_cmd}"
 
+    # OSWorld imports EasyOCR while loading its evaluator registry. Some
+    # headless NeMo-RL containers do not provide libGL.so.1, so the regular
+    # opencv wheel makes the resource server fail before task setup. Normalize
+    # this server venv to the headless wheel even when an existing venv is
+    # reused.
+    if dir_path.name == "osworld" and dir_path.parent.name == "resources_servers":
+        env_setup_cmd += (
+            f" && (uv pip uninstall --python {venv_python_fpath} opencv-python || true)"
+            f" && uv pip install --python {venv_python_fpath} --reinstall opencv-python-headless"
+        )
+
     return f"cd {dir_path} && {env_setup_cmd}"
 
 

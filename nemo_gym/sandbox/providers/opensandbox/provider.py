@@ -760,7 +760,10 @@ class OpenSandboxProvider:
 
     def _rest_headers(self) -> dict[str, str]:
         if self._connection.api_key:
-            return {"Authorization": f"Bearer {self._connection.api_key}"}
+            # OpenSandbox lifecycle-server authentication uses this custom
+            # header. Match ConnectionConfig(api_key=...) so direct pooled
+            # create/list/delete calls also work through authenticated ingress.
+            return {"OPEN-SANDBOX-API-KEY": self._connection.api_key}
         return {}
 
     async def _rest_create_pooled(self, spec: SandboxSpec, options: OpenSandboxProviderOptions) -> str:
