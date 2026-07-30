@@ -104,6 +104,9 @@ from nemo_gym.server_utils import (
 
 # Per-token routed expert indices with shape [tokens, num_moe_layers, topk].
 RoutedExperts: TypeAlias = List[List[List[int]]]
+# JSON-serializable multimodal inputs used to reconstruct the policy forward
+# pass during training (for example, OSWorld's screenshot window).
+MultimodalInputs: TypeAlias = Dict[str, Any]
 
 
 class TokenIDLogProbMixin(BaseModel):
@@ -111,6 +114,7 @@ class TokenIDLogProbMixin(BaseModel):
     generation_token_ids: List[int]
     generation_log_probs: List[float]
     routed_experts: Optional[RoutedExperts] = None
+    multimodal_inputs: Optional[MultimodalInputs] = None
 
 
 class TokenIDLogProbTypedDictMixin(TypedDict):
@@ -118,6 +122,7 @@ class TokenIDLogProbTypedDictMixin(TypedDict):
     generation_token_ids: List[int]
     generation_log_probs: List[float]
     routed_experts: NotRequired[RoutedExperts]
+    multimodal_inputs: NotRequired[MultimodalInputs]
 
 
 ########################################
@@ -379,6 +384,8 @@ class NeMoGymChatCompletionMessageToolCall(ChatCompletionMessageToolCall):
 
 class NeMoGymChatCompletionMessage(ChatCompletionMessage):
     tool_calls: Optional[List[NeMoGymChatCompletionMessageToolCall]] = None
+    reasoning_content: Optional[str] = None
+    reasoning: Optional[str] = None
 
 
 class NeMoGymChatCompletionMessageForTraining(NeMoGymChatCompletionMessage, TokenIDLogProbMixin):

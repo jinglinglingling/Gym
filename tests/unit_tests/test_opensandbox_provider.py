@@ -831,7 +831,7 @@ async def test_pooled_create_via_rest(monkeypatch: pytest.MonkeyPatch) -> None:
     assert body["metadata"]["run"] == "m1"
     # Every pooled create is stamped with a marker so a lost-response record can be reaped.
     assert body["metadata"][opensandbox_provider.POOLED_CREATE_MARKER_KEY]
-    assert kwargs["headers"] == {"Authorization": "Bearer key-1"}
+    assert kwargs["headers"] == {"OPEN-SANDBOX-API-KEY": "key-1"}
 
 
 async def test_pooled_create_error_paths(monkeypatch: pytest.MonkeyPatch, fake_opensandbox_sdk: None) -> None:
