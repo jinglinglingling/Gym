@@ -88,8 +88,7 @@ class NemotronOSWorldAgentConfig(BaseResponsesAPIAgentConfig):
     max_tokens: int = 4096
     max_image_history_length: int = 3
     # Keep the number of samples per GRPO group independent from live VM pressure.
-    # Cell-2's osworld-kvm pool is reliable at four concurrent sessions; larger
-    # groups are queued here and still return all requested samples.
+    # Deployments can raise this to match the available OpenSandbox VM pool.
     max_parallel_rollouts: int = 4
     thinking: bool = True
     coordinate_type: str = "relative"
