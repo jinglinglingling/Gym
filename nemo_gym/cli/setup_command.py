@@ -182,7 +182,8 @@ def setup_env_command(dir_path: Path, global_config_dict: DictConfig, prefix: st
     # reused.
     if dir_path.name == "osworld" and dir_path.parent.name == "resources_servers":
         env_setup_cmd += (
-            f" && (uv pip uninstall --python {venv_python_fpath} opencv-python || true)"
+            f" && (uv pip uninstall --python {venv_python_fpath}"
+            " opencv-python opencv-contrib-python || true)"
             f" && uv pip install --python {venv_python_fpath} --reinstall opencv-python-headless"
         )
 

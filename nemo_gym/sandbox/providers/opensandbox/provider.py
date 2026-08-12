@@ -911,6 +911,12 @@ class OpenSandboxProvider:
         if "://" not in url:
             url = f"{self._connection.protocol or 'http'}://{url}"
         headers = dict(getattr(endpoint, "headers", None) or {})
+        if self._connection.use_server_proxy:
+            # Some OpenSandbox SDK versions return no endpoint headers for a
+            # server-proxied route. The proxy still requires the lifecycle API
+            # key, so retain any SDK-provided route headers while filling in
+            # the configured authentication header.
+            headers = {**self._rest_headers(), **headers}
         return SandboxEndpoint(url=url, headers=headers, proxied=self._connection.use_server_proxy)
 
     async def _create_once(self, spec: SandboxSpec) -> SandboxHandle:

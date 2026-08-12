@@ -1,6 +1,6 @@
-nemotron_osworld_cc:
+nemotron_osworld:
   responses_api_agents:
-    nemotron_osworld_cc:
+    nemotron_osworld:
       entrypoint: cc_app.py
       resources_server:
         type: resources_servers
@@ -10,9 +10,9 @@ nemotron_osworld_cc:
         name: policy_model
       model_name: ${oc.env:OSWORLD_MODEL_NAME,vllm_local}
       debug_trajectory_dir: ${oc.env:OSWORLD_DEBUG_TRAJ_DIR,}
-      max_steps: 100
-      temperature: 0.6
-      top_p: 0.95
+      max_steps: ${oc.decode:${oc.env:OSWORLD_MAX_STEPS,100}}
+      temperature: ${oc.decode:${oc.env:OSWORLD_TEMPERATURE,1.0}}
+      top_p: ${oc.decode:${oc.env:OSWORLD_TOP_P,1.0}}
       max_tokens: 4096
       max_parallel_rollouts: ${oc.decode:${oc.env:OSWORLD_MAX_PARALLEL_ROLLOUTS,4}}
       max_image_history_length: 3
@@ -34,7 +34,10 @@ nemotron_osworld_cc:
             image_omission_marker: "[Earlier image omitted]"
         schedule:
           type: turn_chunked_recency
-          actions_per_chunk: 2
+          actions_per_chunk: ${oc.decode:${oc.env:OSWORLD_CC_ACTIONS_PER_CHUNK,2}}
+        guards:
+          max_total_tokens: ${oc.decode:${oc.env:OSWORLD_CC_MAX_TOTAL_TOKENS,16384}}
+          reserved_generation_tokens: ${oc.decode:${oc.env:OSWORLD_CC_RESERVED_GENERATION_TOKENS,1}}
       datasets:
       - name: os_domain
         type: validation

@@ -146,7 +146,10 @@ def _extract_model_text(output_items: list[Any]) -> dict[str, str]:
                 if isinstance(part, dict) and part.get("text"):
                     text_parts.append(str(part["text"]))
     if not any(part.strip() for part in text_parts):
-        raise RuntimeError("Nemotron Responses call produced no assistant output text")
+        logger.warning(
+            "Nemotron Responses call produced no assistant output text; "
+            "the rollout will be marked as FAIL"
+        )
     return {
         "content": "\n".join(text_parts),
         "reasoning_content": "\n".join(reasoning_parts),
@@ -342,28 +345,52 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
                         else None
                     ),
                 )
-            if last_response.incomplete_details is not None:
-                raise RuntimeError(
-                    "Nemotron Responses call was incomplete: "
-                    f"{last_response.incomplete_details.reason}"
-                )
-
             usage = _merge_usage(usage, last_response.usage)
             transcript.extend(last_response.output)
             parser_input = _extract_model_text(last_response.output)
-            low_level_instruction, actions, cot = parser(
-                parser_input,
-                (self.config.screen_width, self.config.screen_height),
-                self.config.coordinate_type,
-                thinking=self.config.thinking,
-            )
+            if last_response.incomplete_details is not None:
+                # Hitting a policy generation limit is rollout data, not an
+                # infrastructure failure. Keep the exact response in the CC
+                # trace, then score this rollout as unsuccessful.
+                incomplete_reason = last_response.incomplete_details.reason
+                logger.warning(
+                    "Policy response was incomplete (%s); marking rollout as FAIL",
+                    incomplete_reason,
+                )
+                low_level_instruction = f"Policy response was incomplete: {incomplete_reason}"
+                actions = ["FAIL"]
+                cot = {"code": "FAIL", "thinking": parser_input.get("reasoning_content", "")}
+            else:
+                try:
+                    low_level_instruction, actions, cot = parser(
+                        parser_input,
+                        (self.config.screen_width, self.config.screen_height),
+                        self.config.coordinate_type,
+                        thinking=self.config.thinking,
+                    )
+                except Exception:
+                    # A malformed policy action is rollout data, not an infrastructure
+                    # failure. Terminate only this rollout so GRPO can score it as an
+                    # unsuccessful sample instead of aborting the entire batch.
+                    logger.warning(
+                        "Policy response could not be parsed; marking rollout as FAIL",
+                        exc_info=True,
+                    )
+                    low_level_instruction = "Policy response could not be parsed"
+                    actions = ["FAIL"]
+                    cot = {"code": "FAIL", "thinking": parser_input.get("reasoning_content", "")}
             if (
                 not actions
                 or str(low_level_instruction).startswith(":")
                 or not isinstance(cot, dict)
                 or not cot.get("code")
             ):
-                raise RuntimeError(f"Nemotron response parse failed: {low_level_instruction}")
+                logger.warning(
+                    "Policy response parsed to an invalid action; marking rollout as FAIL: %s",
+                    low_level_instruction,
+                )
+                actions = ["FAIL"]
+                cot = {"code": "FAIL", "thinking": parser_input.get("reasoning_content", "")}
 
             if step_idx + 1 >= self.config.max_steps and actions[0] not in ("DONE", "FAIL"):
                 actions = ["FAIL"]
