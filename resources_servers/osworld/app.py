@@ -69,6 +69,27 @@ logger = logging.getLogger("nemo_gym.osworld.resources_server")
 _TASK_SENTINEL = "__NEMO_GYM_OSWORLD__"
 _EVAL_TASK_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_task.py")
 
+
+def _sanitize_setup_config(value: Any) -> Any:
+    """Prevent a known task cleanup command from killing its own shell.
+
+    ``pkill -f`` also inspects the command line of the shell executing it. The
+    bracketed pattern still matches the intended HTTP server but cannot match
+    the literal text in that shell's command line. Keep this runtime-only so
+    the delivered task snapshot remains immutable.
+    """
+    if isinstance(value, dict):
+        return {key: _sanitize_setup_config(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_setup_config(item) for item in value]
+    if isinstance(value, str):
+        return value.replace(
+            "pkill -f 'http.server 8539'",
+            "pkill -f '[h]ttp.server 8539' 2>/dev/null || true",
+        )
+    return value
+
+
 # Guest-environment prep run once at boot. OSWorld's fine-interaction tasks (LibreOffice
 # context menus, menu->dialog flows) fail systematically when a focus-stealing popup —
 # Ubuntu's "Software Updates Ready to Install" (update-notifier) or a notification banner —
@@ -460,21 +481,27 @@ class OSWorldResourcesServer(SimpleResourcesServer):
             logger.warning("Could not read guest screen size, defaulting to 1920x1080: %r", e)
         return {"width": 1920, "height": 1080}
 
-    async def _wait_for_boot(self, sandbox_state: dict) -> None:
-        # 1) Wait for the guest control API (:5000) to answer.
+    async def _wait_for_platform(self, sandbox_state: dict) -> None:
+        """Wait for the guest control API, including transient fork proxy 404s."""
         deadline = time.monotonic() + self.config.boot_wait_s
-        platform_up = False
+        last_status: Optional[int] = None
         while time.monotonic() < deadline:
             try:
                 res = await self._guest_request(sandbox_state, "GET", "/platform")
+                last_status = res.status
                 if res.status == 200:
-                    platform_up = True
-                    break
+                    return
             except Exception:  # noqa: BLE001 - keep polling until the deadline
                 pass
             await asyncio.sleep(self.config.poll_interval_s)
-        if not platform_up:
-            raise RuntimeError(f"OSWorld guest :5000 not reachable within {self.config.boot_wait_s}s")
+        status_suffix = f" (last status {last_status})" if last_status is not None else ""
+        raise RuntimeError(
+            f"OSWorld guest :5000 not reachable within {self.config.boot_wait_s}s{status_suffix}"
+        )
+
+    async def _wait_for_boot(self, sandbox_state: dict) -> None:
+        # 1) Wait for the guest control API (:5000) to answer.
+        await self._wait_for_platform(sandbox_state)
 
         # 2) Wait for the desktop to actually render (screenshot grows past the threshold).
         deadline = time.monotonic() + self.config.boot_wait_s
@@ -554,7 +581,7 @@ class OSWorldResourcesServer(SimpleResourcesServer):
         screen = sandbox_state.get("screen") or {"width": 1920, "height": 1080}
         fd, cfg_path = tempfile.mkstemp(suffix=".json", prefix=f"osw_{phase}_")
         with os.fdopen(fd, "w") as f:
-            json.dump(task_config, f)
+            json.dump(_sanitize_setup_config(task_config) if phase == "setup" else task_config, f)
         headers_fd, headers_path = tempfile.mkstemp(suffix=".json", prefix="osw_headers_")
         os.chmod(headers_path, 0o600)
         with os.fdopen(headers_fd, "w") as f:
@@ -726,13 +753,10 @@ class OSWorldResourcesServer(SimpleResourcesServer):
                 for child in children:
                     state = await self._sandbox_state(child)
                     state["screen"] = dict(parent.get("screen") or {})
-                    # A fork is expected to be immediately runnable, but verify
-                    # the control service before handing it to a rollout.
-                    platform = await self._guest_request(state, "GET", "/platform")
-                    if platform.status != 200:
-                        raise RuntimeError(
-                            f"forked OSWorld sandbox {state['sandbox_id']} returned {platform.status} from /platform"
-                        )
+                    # AgentEnv can publish the fork before its guest proxy route
+                    # is ready, briefly returning 404. Poll it just like a fresh
+                    # sandbox instead of failing the entire rollout group.
+                    await self._wait_for_platform(state)
                     states.append(state)
         except Exception:
             await asyncio.gather(*(self._release(state) for state in states), return_exceptions=True)

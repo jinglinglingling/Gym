@@ -205,6 +205,21 @@ class TestApp:
         server = OSWorldResourcesServer(config=_make_config(), server_client=MagicMock(spec=ServerClient))
         assert server.session_id_to_sandbox == {}
 
+    def test_sanitize_setup_config_avoids_pkill_self_match_without_mutation(self) -> None:
+        command = (
+            "pkill -f 'http.server 8539'; "
+            "rm -rf /home/user/crosstown && mkdir -p /home/user/crosstown"
+        )
+        task_config = {"config": [{"parameters": {"command": command}}]}
+
+        sanitized = app_module._sanitize_setup_config(task_config)
+
+        assert task_config["config"][0]["parameters"]["command"] == command
+        assert sanitized["config"][0]["parameters"]["command"] == (
+            "pkill -f '[h]ttp.server 8539' 2>/dev/null || true; "
+            "rm -rf /home/user/crosstown && mkdir -p /home/user/crosstown"
+        )
+
     async def test_evaluation_pointer_reset_disables_failsafe(self, monkeypatch: MonkeyPatch) -> None:
         server = OSWorldResourcesServer(config=_make_config(), server_client=MagicMock(spec=ServerClient))
         calls: List[Dict[str, Any]] = []
@@ -521,6 +536,30 @@ class TestAgentEnvForkOversampling:
         assert list(states) == [1, 3, 7]
         assert [state["sandbox_id"] for state in states.values()] == ["parent", "child-1", "child-2"]
         assert all(state["screen"] == {"width": 1920, "height": 1080} for state in states.values())
+
+    async def test_wait_for_platform_retries_transient_fork_404(self, monkeypatch: MonkeyPatch) -> None:
+        server = OSWorldResourcesServer(
+            config=_make_config(boot_wait_s=1, poll_interval_s=0),
+            server_client=MagicMock(spec=ServerClient),
+        )
+        statuses = iter((404, 404, 200))
+        observed: List[int] = []
+
+        async def platform(_state: dict, method: str, path: str, **_kwargs: Any) -> app_module._HTTPResult:
+            assert (method, path) == ("GET", "/platform")
+            status = next(statuses)
+            observed.append(status)
+            return app_module._HTTPResult(status=status, content=b"")
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(server, "_guest_request", platform)
+        monkeypatch.setattr(app_module.asyncio, "sleep", no_sleep)
+
+        await server._wait_for_platform({"sandbox_id": "fork-1"})
+
+        assert observed == [404, 404, 200]
 
 
 def _minimal_response(text: str) -> dict:
