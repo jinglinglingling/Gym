@@ -1152,6 +1152,13 @@ class VLLMModel(SimpleResponsesAPIModel):
             chat_completion_dict.pop("prompt_token_ids", None)
             choice_dict.pop("token_ids", None)
             choice_dict["message"] = NeMoGymChatCompletionMessageForTraining.model_validate(message_dict)
+        else:
+            # Some NeMo-RL generation workers always return routed-expert
+            # transport metadata even when this adapter did not request token
+            # information. A routed_experts-only message is intentionally
+            # invalid: token metadata is atomic. Keep ordinary inference
+            # responses token-free instead of forwarding a partial bundle.
+            self._strip_capture_transport_fields(chat_completion_dict)
 
         return NeMoGymChatCompletion.model_validate(chat_completion_dict)
 
