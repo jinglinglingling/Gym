@@ -158,8 +158,11 @@ class RolloutResult:
     # Resolved Gym-owned model/history behavior. It is deliberately distinct
     # from request-owned sampling parameters and infrastructure provenance.
     agent_contract: Optional[Dict[str, Any]] = None
+    episode_end: Optional[str] = None
 
     def __post_init__(self) -> None:
+        if self.episode_end is not None and self.episode_end not in EPISODE_END_KINDS:
+            raise ValueError(f"RolloutResult.episode_end must be one of {EPISODE_END_KINDS}")
         for field_name in (
             "finished",
             "horizon_reached",
@@ -242,6 +245,20 @@ def _terminal_action_name(action: Any) -> Optional[str]:
     if isinstance(action, dict) and action.get("action_type") in _TERMINAL_ACTIONS:
         return str(action["action_type"])
     return None
+
+
+EPISODE_END_KINDS = ("done", "agent_fail", "forced_fail", "unterminated")
+
+
+def _episode_end_kind(terminal_action: Optional[str], forced_terminal: Optional[str]) -> str:
+    """How the policy ended the episode; ``forced_fail`` is a FAIL the adapter injected."""
+    if forced_terminal is not None:
+        return "forced_fail"
+    if terminal_action == "DONE":
+        return "done"
+    if terminal_action == "FAIL":
+        return "agent_fail"
+    return "unterminated"
 
 
 def _flatten_actions(actions: Any) -> List[Any]:
@@ -1884,6 +1901,7 @@ def run_osworld_task(
     horizon_reached = False
     evaluation_completed = False
     agent_terminal_action: Optional[str] = None
+    agent_forced_terminal: Optional[str] = None
     agent_stop_reason: Optional[str] = None
     agent_model_call_completed: Optional[bool] = None
     operation_failure_reason: Optional[str] = None
@@ -2457,6 +2475,8 @@ def run_osworld_task(
                 terminal_action = _terminal_action_name(action)
                 if terminal_action is not None:
                     agent_terminal_action = terminal_action
+                    forced_terminal = agent_step_info.get("forced_terminal")
+                    agent_forced_terminal = forced_terminal if isinstance(forced_terminal, str) else None
                 task_logger.info("Step %d executing action: %r", step_idx + 1, action)
                 try:
                     obs, reward, done, info = env.step(action, sleep_after_execution)
@@ -2651,6 +2671,19 @@ def run_osworld_task(
             outcome.horizon_reached,
         )
 
+    episode_end = _episode_end_kind(agent_terminal_action, agent_forced_terminal)
+    print(
+        "OSWORLD_EPISODE_END|"
+        f"rollout_id={event_context.get('rollout_id', 'none')}|"
+        f"episode_end={episode_end}|"
+        f"forced_terminal={agent_forced_terminal or 'none'}|"
+        f"termination={outcome.termination_reason}|"
+        f"steps={len(steps)}|"
+        f"reward={reward}|"
+        f"mask_sample={outcome.mask_sample}",
+        flush=True,
+    )
+
     result = RolloutResult(
         reward=reward,
         score=final_score,
@@ -2666,6 +2699,7 @@ def run_osworld_task(
         artifact_dir=task_artifacts.directory if task_artifacts is not None else None,
         termination_reason=outcome.termination_reason,
         agent_contract=effective_agent_contract,
+        episode_end=episode_end,
     )
     _finalize_task_artifacts(
         task_artifacts,
