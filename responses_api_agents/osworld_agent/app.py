@@ -377,6 +377,9 @@ class OSWorldAgentConfig(BaseResponsesAPIAgentConfig):
     # receives this value as a cooperative deadline so model/step boundaries
     # can stop cleanly before the parent has to cancel the Ray task.
     task_timeout: int = 1800
+    # Agent-loop budget counted from the first step, like the pre-rebase
+    # cc_app rollout_timeout_s; reaching it ends the rollout as a timeout.
+    rollout_timeout_s: Optional[float] = Field(default=None, gt=0)
     task_cancel_grace_s: float = Field(default=30.0, gt=0)
     # Optional semantic Ray resources for each OSWorld rollout task. This lets
     # an embedding scheduler keep image-heavy environment work off trainer
@@ -889,6 +892,9 @@ def _record_served_response_id(normalized: Dict[str, Any], resp: Any) -> None:
     prompt_tokens = getattr(getattr(resp, "usage", None), "prompt_tokens", None)
     if type(prompt_tokens) is int:
         normalized["prompt_tokens"] = prompt_tokens
+    completion_tokens = getattr(getattr(resp, "usage", None), "completion_tokens", None)
+    if type(completion_tokens) is int:
+        normalized["completion_tokens"] = completion_tokens
 
 
 def _recover_first_fenced_action(content: str) -> str | None:
@@ -1569,6 +1575,7 @@ class OSWorldAgent(SimpleResponsesAPIAgent):
                 "step_timeout": self.config.step_timeout,
                 "model_timeout": self.config.model_timeout,
                 "task_timeout": self.config.task_timeout,
+                "rollout_timeout_s": self.config.rollout_timeout_s,
                 "docker_port_lock_timeout": self.config.docker_port_lock_timeout,
                 "evaluator_disable_gpu": self.config.evaluator_disable_gpu,
                 "reward_mode": self.config.reward_mode,
@@ -1949,7 +1956,7 @@ def _served_model_call_output(
     terminal_response_id: Optional[str] = None
     references: List[Dict[str, str]] = []
     for model_call in model_calls:
-        if model_call.get("accepted") is not True:
+        if model_call.get("loss_member", model_call.get("accepted")) is not True:
             continue
         response = model_call.get("response")
         if not isinstance(response, Mapping):
