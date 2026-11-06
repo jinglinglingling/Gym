@@ -64,6 +64,7 @@ class ContextManagedResponsesClient:
         seed_observations: Sequence[Any] = (),
         cookies: Any = None,
         token_capture: bool = True,
+        selected_output_transform: Callable[[NeMoGymResponse], Sequence[Any]] | None = None,
     ):
         # Validate identity without creating a second owner/segment namespace.
         capture_rollout_id(logical_rollout_id, 0)
@@ -81,6 +82,7 @@ class ContextManagedResponsesClient:
         self.logical_rollout_id = logical_rollout_id
         self.config = config.model_copy(deep=True)
         self.token_capture = token_capture
+        self.selected_output_transform = selected_output_transform
         if not self.token_capture and self.config.guards.max_total_tokens is not None:
             raise ValueError(
                 "max_total_tokens requires token capture; inference-only context "
@@ -259,9 +261,14 @@ class ContextManagedResponsesClient:
         if not response.id or response.id in self._selected_ids:
             raise ValueError("Model response identity is missing or reused")
         first_event = len(self.history.events)
-        self.history.append_items(response.output, turn_id=self._step)
+        history_output = (
+            self.selected_output_transform(response)
+            if self.selected_output_transform is not None
+            else response.output
+        )
+        self.history.append_items(history_output, turn_id=self._step)
         appended = self.history.events[first_event:]
-        output = normalize_semantic_items(response.output)
+        output = normalize_semantic_items(history_output)
         # Acknowledge the completed view, including the selected action. Comparing only
         # requests would silently undo removal of the immediately preceding reasoning.
         completed = replace(

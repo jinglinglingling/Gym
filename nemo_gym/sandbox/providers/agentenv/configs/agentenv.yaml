@@ -18,3 +18,5 @@ osworld_resources_server:
   resources_servers:
     osworld:
       fork_oversampling: true
+      alloc_retry_deadline_s: ${oc.decode:${oc.env:OSWORLD_SANDBOX_RETRY_SEC,1200}}
+      agentenv_template_weights: ${oc.env:AGENTENV_TEMPLATE_WEIGHTS,""}

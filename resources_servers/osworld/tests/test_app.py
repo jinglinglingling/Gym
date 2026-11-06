@@ -216,9 +216,135 @@ class TestApp:
 
         assert task_config["config"][0]["parameters"]["command"] == command
         assert sanitized["config"][0]["parameters"]["command"] == (
-            "pkill -f '[h]ttp.server 8539' 2>/dev/null || true; "
+            "pkill -f '(^|/)python3? -m http[.]server 8539( |$)' "
+            "2>/dev/null || true; "
             "rm -rf /home/user/crosstown && mkdir -p /home/user/crosstown"
         )
+
+    def test_sanitize_setup_config_anchors_bracketed_http_server_cleanup(self) -> None:
+        command = (
+            "pkill -f 'http[.]server 8545' 2>/dev/null; "
+            "nohup python3 -m http.server 8545 --bind 127.0.0.1 "
+            "--directory /home/user/northgate >/tmp/server.log 2>&1 & sleep 1"
+        )
+        task_config = {"config": [{"parameters": {"command": command}}]}
+
+        sanitized = app_module._sanitize_setup_config(task_config)
+
+        assert task_config["config"][0]["parameters"]["command"] == command
+        sanitized_command = sanitized["config"][0]["parameters"]["command"]
+        assert sanitized_command.startswith(
+            "pkill -f '(^|/)python3? -m http[.]server 8545( |$)' "
+            "2>/dev/null || true; "
+        )
+        assert "nohup python3 -m http.server 8545" in sanitized_command
+
+    def test_sanitize_setup_config_repairs_python_c_string_newlines(self) -> None:
+        command = (
+            "import json,os; p='/tmp/settings.json'; "
+            "open(p,'w').write(json.dumps({'editor.tabSize':4})+'\n')"
+        )
+        multiline_command = (
+            "import os; p='/tmp/mimeapps.list'; "
+            "open(p,'w').write('[Default Applications]\n"
+            "text/plain=org.gnome.gedit.desktop\n')"
+        )
+        task_config = {
+            "config": [
+                {"parameters": {"command": ["python3", "-c", command]}},
+                {
+                    "parameters": {
+                        "command": ["/usr/bin/python3", "-c", multiline_command]
+                    }
+                },
+            ]
+        }
+
+        sanitized = app_module._sanitize_setup_config(task_config)
+
+        assert task_config["config"][0]["parameters"]["command"][2] == command
+        sanitized_commands = [
+            item["parameters"]["command"][2] for item in sanitized["config"]
+        ]
+        assert sanitized_commands[0].endswith(
+            "open(p,'w').write(json.dumps({'editor.tabSize':4})+'\\n')"
+        )
+        assert "'[Default Applications]\\ntext/plain=" in sanitized_commands[1]
+        for sanitized_command in sanitized_commands:
+            compile(sanitized_command, "<sanitized-setup>", "exec")
+
+    def test_sanitize_setup_config_makes_forked_registry_idempotent(self) -> None:
+        command = [
+            "python3",
+            "/home/user/.golden/volcano_registry.py",
+            "8471",
+        ]
+        task_config = {
+            "config": [
+                {
+                    "type": "execute",
+                    "parameters": {"command": command, "shell": False},
+                }
+            ]
+        }
+
+        sanitized = app_module._sanitize_setup_config(task_config)
+
+        assert task_config["config"][0]["parameters"]["command"] == command
+        sanitized_command = sanitized["config"][0]["parameters"]["command"]
+        assert sanitized_command[:2] == ["/bin/sh", "-c"]
+        assert "grep -Fq 'Volcano Summit Registry'" in sanitized_command[2]
+        assert sanitized_command[2].endswith(
+            "exec python3 /home/user/.golden/volcano_registry.py 8471"
+        )
+
+    def test_sanitize_setup_config_guards_generic_pkill_f_pattern(self) -> None:
+        command = (
+            "pkill -f thunderbird; sleep 1; "
+            "python3 -c \"print('setup continues')\""
+        )
+        task_config = {"config": [{"parameters": {"command": command}}]}
+
+        sanitized = app_module._sanitize_setup_config(task_config)
+
+        assert task_config["config"][0]["parameters"]["command"] == command
+        assert sanitized["config"][0]["parameters"]["command"] == (
+            "for name in thunderbird thunderbird-bin thunderbird-esr; "
+            'do pkill -x "$name" || true; done; sleep 1; '
+            "python3 -c \"print('setup continues')\""
+        )
+
+    def test_sanitize_setup_config_detaches_terminal_cleanup(self) -> None:
+        command = ["/bin/bash", "-c", "killall gnome-terminal-server"]
+        task_config = {
+            "evaluator": {
+                "postconfig": [
+                    {
+                        "type": "execute",
+                        "parameters": {"command": command, "expected_returncodes": [0, 1]},
+                    }
+                ]
+            }
+        }
+
+        sanitized = app_module._sanitize_setup_config(task_config)
+        sanitized_command = sanitized["evaluator"]["postconfig"][0]["parameters"]["command"]
+
+        assert command == ["/bin/bash", "-c", "killall gnome-terminal-server"]
+        assert sanitized_command[:2] == ["/bin/bash", "-c"]
+        assert "nohup setsid" in sanitized_command[2]
+        assert "sleep 0.5" in sanitized_command[2]
+        assert "pkill -x gnome-terminal-server" in sanitized_command[2]
+
+    def test_sandbox_eval_cache_is_stable_and_isolated(self, tmp_path: Path) -> None:
+        first = {"sandbox_id": "sandbox-1", "control_url": "http://example/1"}
+        sibling = {"sandbox_id": "sandbox-2", "control_url": "http://example/2"}
+
+        first_cache = app_module._sandbox_eval_cache_dir(str(tmp_path), first)
+
+        assert first_cache == app_module._sandbox_eval_cache_dir(str(tmp_path), first)
+        assert first_cache != app_module._sandbox_eval_cache_dir(str(tmp_path), sibling)
+        assert Path(first_cache).parent == tmp_path / "sandboxes"
 
     async def test_evaluation_pointer_reset_disables_failsafe(self, monkeypatch: MonkeyPatch) -> None:
         server = OSWorldResourcesServer(config=_make_config(), server_client=MagicMock(spec=ServerClient))
@@ -242,6 +368,71 @@ class TestApp:
         ]
         assert "pyautogui.FAILSAFE=False" in calls[0]["command"]
         assert "pyautogui.moveTo" in calls[0]["command"]
+
+    async def test_agentenv_osworld_v2_compat_is_template_gated(self, monkeypatch: MonkeyPatch) -> None:
+        server = OSWorldResourcesServer(config=_make_config(), server_client=MagicMock(spec=ServerClient))
+        calls: List[Dict[str, Any]] = []
+
+        async def fake_execute(sandbox_state: dict, command: Any, shell: bool) -> Dict[str, Any]:
+            calls.append({"sandbox_state": sandbox_state, "command": command, "shell": shell})
+            return {"stdout": "AGENTENV_OSWORLD_V2_COMPAT_READY", "returncode": 0}
+
+        monkeypatch.setattr(server, "_guest_execute", fake_execute)
+        await server._prepare_agentenv_template_compat(
+            {"sandbox_id": "slim", "template": "osworld-slim"}
+        )
+        assert calls == []
+
+        sandbox_state = {"sandbox_id": "v2", "template": "osworld-v2"}
+        await server._prepare_agentenv_template_compat(sandbox_state)
+
+        assert calls == [
+            {
+                "sandbox_state": sandbox_state,
+                "command": app_module._AGENTENV_OSWORLD_V2_COMPAT_SCRIPT,
+                "shell": True,
+            }
+        ]
+        assert "chrome/deb" in calls[0]["command"]
+        assert "/usr/local/bin/update-desktop-database" in calls[0]["command"]
+
+    async def test_agentenv_osworld_v2_compat_fails_closed(self, monkeypatch: MonkeyPatch) -> None:
+        server = OSWorldResourcesServer(config=_make_config(), server_client=MagicMock(spec=ServerClient))
+
+        async def fake_execute(sandbox_state: dict, command: Any, shell: bool) -> Dict[str, Any]:
+            del sandbox_state, command, shell
+            return {"stderr": "sudo denied", "returncode": 1}
+
+        monkeypatch.setattr(server, "_guest_execute", fake_execute)
+
+        with pytest.raises(RuntimeError, match="compatibility setup failed"):
+            await server._prepare_agentenv_template_compat(
+                {"sandbox_id": "v2", "template": "osworld-v2"}
+            )
+
+    def test_agentenv_template_weights_are_parsed_and_sampled(self, monkeypatch: MonkeyPatch) -> None:
+        server = OSWorldResourcesServer(
+            config=_make_config(
+                agentenv_template_weights="osworld-v1:1,osworld-slim:1,osworld-v2:1"
+            ),
+            server_client=MagicMock(spec=ServerClient),
+        )
+        choices: List[tuple[List[str], List[float]]] = []
+
+        def fake_choices(names: List[str], weights: List[float], k: int) -> List[str]:
+            choices.append((names, weights))
+            assert k == 1
+            return ["osworld-v2"]
+
+        monkeypatch.setattr(app_module.random, "choices", fake_choices)
+
+        assert server._agentenv_template() == "osworld-v2"
+        assert choices == [
+            (
+                ["osworld-v1", "osworld-slim", "osworld-v2"],
+                [1.0, 1.0, 1.0],
+            )
+        ]
 
     def test_screenshot_rejects_non_png_guest_response(self, monkeypatch: MonkeyPatch) -> None:
         monkeypatch.setattr(app_module, "gym_request", fake_gym_request)

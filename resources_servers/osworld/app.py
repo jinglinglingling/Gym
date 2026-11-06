@@ -37,9 +37,12 @@ client; the ``_guest_request`` / ``_run_task_phase`` seams are what unit tests m
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
+import random
+import re
 import sys
 import tempfile
 import time
@@ -68,26 +71,214 @@ logger = logging.getLogger("nemo_gym.osworld.resources_server")
 # eval_task.py prints exactly one sentinel line to stdout per invocation.
 _TASK_SENTINEL = "__NEMO_GYM_OSWORLD__"
 _EVAL_TASK_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval_task.py")
+_PKILL_F_PATTERN = re.compile(
+    r"(?P<prefix>\bpkill(?:\s+-[A-Za-z0-9]+)*\s+-f\s+)"
+    r"(?P<quote>['\"]?)(?P<pattern>[^\s;'\"\n]+)(?P=quote)"
+)
+_HTTP_SERVER_PKILL_PATTERN = re.compile(
+    r"\bpkill\s+-f\s+(['\"])http(?:\[\.\]|\.)server\s+"
+    r"(?P<port>\d+)\1(?:\s+2>/dev/null)?(?:\s*\|\|\s*true)?"
+)
+_THUNDERBIRD_PKILL_REPLACEMENTS = (
+    (
+        "pkill -TERM -f thunderbird || true",
+        "for name in thunderbird thunderbird-bin thunderbird-esr; "
+        'do pkill -TERM -x "$name" || true; done',
+    ),
+    (
+        "pkill -f thunderbird || true",
+        "for name in thunderbird thunderbird-bin thunderbird-esr; "
+        'do pkill -x "$name" || true; done',
+    ),
+    (
+        "pkill -TERM -f thunderbird",
+        "for name in thunderbird thunderbird-bin thunderbird-esr; "
+        'do pkill -TERM -x "$name" || true; done',
+    ),
+    (
+        "pkill -f thunderbird",
+        "for name in thunderbird thunderbird-bin thunderbird-esr; "
+        'do pkill -x "$name" || true; done',
+    ),
+)
+
+
+def _guard_pkill_f_self_match(match: re.Match[str]) -> str:
+    """Hide a process pattern from the setup shell's literal command line."""
+    pattern = match.group("pattern")
+    if re.search(r"\[[^\]]+\]", pattern):
+        return match.group(0)
+    first_alnum = next(
+        (index for index, character in enumerate(pattern) if character.isalnum()),
+        None,
+    )
+    if first_alnum is None:
+        return match.group(0)
+    guarded = (
+        pattern[:first_alnum]
+        + f"[{pattern[first_alnum]}]"
+        + pattern[first_alnum + 1 :]
+    )
+    return (
+        match.group("prefix")
+        + match.group("quote")
+        + guarded
+        + match.group("quote")
+    )
+
+
+def _guard_http_server_pkill(match: re.Match[str]) -> str:
+    """Match only the server process, not a shell that starts it later."""
+    port = match.group("port")
+    return (
+        "pkill -f '(^|/)python3? -m http[.]server "
+        f"{port}( |$)' 2>/dev/null || true"
+    )
+
+
+def _escape_invalid_python_string_newlines(source: str) -> str:
+    """Escape literal newlines inside non-triple-quoted Python strings."""
+    output: List[str] = []
+    quote: Optional[str] = None
+    triple_quoted = False
+    in_comment = False
+    index = 0
+    while index < len(source):
+        character = source[index]
+        if in_comment:
+            output.append(character)
+            if character == "\n":
+                in_comment = False
+            index += 1
+            continue
+        if quote is None:
+            if character == "#":
+                in_comment = True
+                output.append(character)
+                index += 1
+                continue
+            if character in {"'", '"'}:
+                quote = character
+                triple_quoted = source.startswith(character * 3, index)
+                delimiter_length = 3 if triple_quoted else 1
+                output.append(character * delimiter_length)
+                index += delimiter_length
+                continue
+            output.append(character)
+            index += 1
+            continue
+        if triple_quoted:
+            if source.startswith(quote * 3, index):
+                output.append(quote * 3)
+                index += 3
+                quote = None
+                triple_quoted = False
+            else:
+                output.append(character)
+                index += 1
+            continue
+        if character == "\\" and index + 1 < len(source):
+            output.extend((character, source[index + 1]))
+            index += 2
+            continue
+        if character == quote:
+            output.append(character)
+            quote = None
+            index += 1
+            continue
+        if character == "\n":
+            output.append("\\n")
+            index += 1
+            continue
+        output.append(character)
+        index += 1
+    return "".join(output)
 
 
 def _sanitize_setup_config(value: Any) -> Any:
-    """Prevent a known task cleanup command from killing its own shell.
+    """Make known task cleanup commands portable and safe.
 
-    ``pkill -f`` also inspects the command line of the shell executing it. The
-    bracketed pattern still matches the intended HTTP server but cannot match
-    the literal text in that shell's command line. Keep this runtime-only so
+    ``pkill -f`` also inspects the command line of the shell executing it.
+    HTTP-server cleanup is anchored to the Python process executable so it
+    cannot match a parent shell that starts that server later in the same
+    command. Other patterns receive a bracket guard. Keep this runtime-only so
     the delivered task snapshot remains immutable.
+
+    Forked generations can inherit a task-local HTTP service started while
+    initializing the shared parent. Make that service's setup idempotent after
+    verifying that the expected registry, rather than an unrelated listener,
+    owns the port.
+
+    Some official OSWorld postconfig steps call ``killall`` on the terminal
+    server. Killing that server synchronously can also terminate the shell
+    servicing the guest execute request, so the controller observes ``-15``
+    instead of the task's allowed ``0``/``1``. Detach a short delayed cleanup
+    with ``setsid`` so the execute response is returned before the terminal
+    process is stopped.
     """
     if isinstance(value, dict):
         return {key: _sanitize_setup_config(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [_sanitize_setup_config(item) for item in value]
+        sanitized = [_sanitize_setup_config(item) for item in value]
+        if (
+            len(sanitized) >= 3
+            and isinstance(sanitized[0], str)
+            and os.path.basename(sanitized[0]) in {"python", "python3"}
+            and sanitized[1] == "-c"
+            and isinstance(sanitized[2], str)
+        ):
+            sanitized[2] = _escape_invalid_python_string_newlines(sanitized[2])
+        if sanitized == [
+            "python3",
+            "/home/user/.golden/volcano_registry.py",
+            "8471",
+        ]:
+            return [
+                "/bin/sh",
+                "-c",
+                "if curl -fsS --max-time 2 http://127.0.0.1:8471/ "
+                "| grep -Fq 'Volcano Summit Registry'; then exit 0; fi; "
+                "exec python3 /home/user/.golden/volcano_registry.py 8471",
+            ]
+        return sanitized
     if isinstance(value, str):
-        return value.replace(
-            "pkill -f 'http.server 8539'",
-            "pkill -f '[h]ttp.server 8539' 2>/dev/null || true",
+        sanitized = value
+        for unsafe, safe in _THUNDERBIRD_PKILL_REPLACEMENTS:
+            sanitized = sanitized.replace(unsafe, safe)
+        # A bracket expression hides the pkill pattern itself from the setup
+        # shell, but it is still unsafe when the same shell command later starts
+        # ``python3 -m http.server PORT``: pkill sees that literal launch command
+        # in the shell's argv and kills the shell. Anchor the match to the Python
+        # process executable so both ``python3`` and ``/usr/bin/python3`` work
+        # without matching ``...; nohup python3 ...`` in the parent shell.
+        sanitized = _HTTP_SERVER_PKILL_PATTERN.sub(
+            _guard_http_server_pkill, sanitized
         )
+        sanitized = (
+            sanitized.replace(
+                "killall gnome-terminal-server",
+                "nohup setsid /bin/sh -c "
+                "'sleep 0.5; pkill -x gnome-terminal-server 2>/dev/null || true' "
+                ">/dev/null 2>&1 </dev/null &",
+            )
+        )
+        return _PKILL_F_PATTERN.sub(_guard_pkill_f_self_match, sanitized)
     return value
+
+
+def _sandbox_eval_cache_dir(base_dir: str, sandbox_state: dict) -> str:
+    """Return a stable cache root isolated to one physical sandbox.
+
+    Forked rollouts evaluate concurrently. The upstream harness otherwise
+    writes every sibling's downloaded/result file to
+    ``<base>/<task_id>/<dest>``; concurrent writes can leave truncated PNG or
+    PPTX files. A sandbox-specific root preserves setup/evaluate continuity
+    while preventing siblings from sharing mutable evaluator artifacts.
+    """
+
+    identity = f"{sandbox_state.get('sandbox_id', '')}|{sandbox_state.get('control_url', '')}"
+    token = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+    return os.path.join(base_dir, "sandboxes", token)
 
 
 # Guest-environment prep run once at boot. OSWorld's fine-interaction tasks (LibreOffice
@@ -116,6 +307,38 @@ _MAXIMIZE_OFFICE_SCRIPT = (
     "sleep 4; fit; sleep 3; fit; sleep 2; "
     "echo WINDOW_FITTED; wmctrl -lG 2>/dev/null | grep -iE 'libreoffice|calc|writer|impress|draw|gimp'"
 )
+
+# The AgentEnv `osworld-v2` snapshot is older than the current external Chrome
+# repository key and contains two Chrome apt sources. Disable only the stale
+# duplicate; the `chrome-stable/deb` source remains enabled. The snapshot also
+# runs task setup as the desktop user, while bare `update-desktop-database`
+# attempts to update read-only system directories. Route that no-argument user
+# invocation to the per-user applications directory. Both repairs happen before
+# official task setup and are restricted to this one immutable template.
+_AGENTENV_OSWORLD_V2_COMPAT_SCRIPT = r"""
+set -eu
+for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+  [ -f "$source_file" ] || continue
+  if grep -q 'https://dl.google.com/linux/chrome/deb' "$source_file"; then
+    echo password | sudo -S sed -i \
+      '\|https://dl.google.com/linux/chrome/deb|{ /^[[:space:]]*#/! s|^|# nemo-gym disabled stale duplicate: |; }' \
+      "$source_file"
+  fi
+done
+wrapper="$(mktemp)"
+cat >"$wrapper" <<'EOF'
+#!/bin/sh
+if [ "$#" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+  target="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  mkdir -p "$target"
+  exec /usr/bin/update-desktop-database "$target"
+fi
+exec /usr/bin/update-desktop-database "$@"
+EOF
+echo password | sudo -S install -m 0755 "$wrapper" /usr/local/bin/update-desktop-database
+rm -f "$wrapper"
+echo AGENTENV_OSWORLD_V2_COMPAT_READY
+"""
 
 # Always run (independent of the OOD popup/window prep): disable LibreOffice's "Keep Current
 # Format?" alien-format warning so the evaluator postconfig's ctrl+s saves xlsx SILENTLY. Without
@@ -199,6 +422,9 @@ class OSWorldResourcesServerConfig(BaseResourcesServerConfig):
     # Retry seed_session with a fresh sandbox on boot/setup failure (a single VM occasionally
     # fails to boot in time under concurrency; without retry that 500 crashes the whole run).
     alloc_retries: int = 3
+    # During a provider outage, Yi's production runner keeps retrying sandbox
+    # creation instead of converting unavailable infrastructure into reward 0.
+    alloc_retry_deadline_s: float = 0.0
     poll_interval_s: float = 10.0
     # The desktop renders once the screenshot PNG grows past ~500KB (a black, un-rendered
     # screen is a tiny ~6KB PNG). Validated on the OpenSandbox runc-kvm OSWorld image.
@@ -240,6 +466,9 @@ class OSWorldResourcesServerConfig(BaseResourcesServerConfig):
     # owners from that exact state. This does not create extra trajectories.
     fork_oversampling: bool = False
     fork_claim_timeout_s: float = 7200.0
+    # Yi's AgentEnv production recipe samples one VM template per initialized
+    # prompt group, then forks all active generations from that exact state.
+    agentenv_template_weights: str = ""
 
 
 class OSWorldSeedSessionRequest(BaseSeedSessionRequest):
@@ -253,6 +482,7 @@ class OSWorldSeedSessionResponse(BaseSeedSessionResponse):
     model_config = ConfigDict(extra="allow")
     sandbox_id: Optional[str] = None
     screen: Optional[Dict[str, int]] = None
+    template: Optional[str] = None
 
 
 class ExecuteToolRequest(BaseModel):
@@ -341,14 +571,37 @@ class OSWorldResourcesServer(SimpleResourcesServer):
             self._provider_metadata = resolve_provider_metadata(self.config.sandbox_provider, named_configs)
         return self._provider_config, self._provider_metadata or {}
 
+    def _agentenv_template(self) -> str | None:
+        raw = self.config.agentenv_template_weights.strip()
+        if not raw:
+            return None
+        weights: dict[str, float] = {}
+        for item in raw.split(","):
+            name, separator, weight = item.strip().rpartition(":")
+            if not separator or not name:
+                raise ValueError(
+                    "agentenv_template_weights must contain template:weight entries"
+                )
+            parsed_weight = float(weight)
+            if parsed_weight <= 0:
+                raise ValueError("AgentEnv template weights must be positive")
+            weights[name] = parsed_weight
+        return random.choices(
+            list(weights),
+            weights=list(weights.values()),
+            k=1,
+        )[0]
+
     def _sandbox_spec(self) -> SandboxSpec:
         provider_config, provider_metadata = self._resolved_provider()
         provider_name = next(iter(provider_config))
         if provider_name == "agentenv":
+            template = self._agentenv_template()
             return SandboxSpec(
                 ttl_s=self.config.sandbox_ttl_s,
                 ports=(5000, 9222, 8080),
                 metadata={**provider_metadata, "purpose": "osworld"},
+                provider_options={"template": template} if template else {},
             )
         return SandboxSpec(
             image=self.config.sandbox_image,
@@ -373,6 +626,9 @@ class OSWorldResourcesServer(SimpleResourcesServer):
             "headers": dict(control.headers),
             "proxied": proxied,
         }
+        handle_raw = sandbox._require_handle().raw
+        if isinstance(handle_raw, dict):
+            state["template"] = handle_raw.get("template")
         if len(endpoints) > 1:
             state["service_endpoints"] = {
                 str(port): {
@@ -393,6 +649,26 @@ class OSWorldResourcesServer(SimpleResourcesServer):
         except Exception:
             await self._release({"sandbox": sandbox, "sandbox_id": "?"})
             raise
+
+    async def _allocate_sandbox_with_retry(self) -> dict:
+        deadline = time.monotonic() + self.config.alloc_retry_deadline_s
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await self._allocate_sandbox()
+            except Exception:
+                remaining_s = deadline - time.monotonic()
+                if self.config.alloc_retry_deadline_s <= 0 or remaining_s <= 0:
+                    raise
+                delay_s = min(60.0, 5.0 * attempt, remaining_s)
+                logger.warning(
+                    "OSWorld sandbox allocation attempt %d failed; retrying in %.1fs",
+                    attempt,
+                    delay_s,
+                    exc_info=True,
+                )
+                await asyncio.sleep(delay_s)
 
     async def _release(self, sandbox_state: dict) -> None:
         try:
@@ -499,6 +775,22 @@ class OSWorldResourcesServer(SimpleResourcesServer):
             f"OSWorld guest :5000 not reachable within {self.config.boot_wait_s}s{status_suffix}"
         )
 
+    async def _prepare_agentenv_template_compat(self, sandbox_state: dict) -> None:
+        """Repair known boot-image drift without changing task semantics."""
+        if sandbox_state.get("template") != "osworld-v2":
+            return
+        result = await self._guest_execute(
+            sandbox_state,
+            _AGENTENV_OSWORLD_V2_COMPAT_SCRIPT,
+            shell=True,
+        )
+        returncode = result.get("returncode", result.get("exit_code", 0))
+        if returncode not in (None, 0):
+            raise RuntimeError(
+                f"AgentEnv osworld-v2 compatibility setup failed with return code {returncode}: {result!r}"
+            )
+        logger.info("AgentEnv osworld-v2 compatibility setup applied")
+
     async def _wait_for_boot(self, sandbox_state: dict) -> None:
         # 1) Wait for the guest control API (:5000) to answer.
         await self._wait_for_platform(sandbox_state)
@@ -520,7 +812,11 @@ class OSWorldResourcesServer(SimpleResourcesServer):
                 "OSWorld desktop did not exceed %d bytes; proceeding anyway", self.config.screenshot_min_bytes
             )
 
-        # 3) Always: make xlsx saves silent so the agent's formatting persists (see
+        # 3) Repair drift in the AgentEnv osworld-v2 boot snapshot before any
+        #    official task setup runs.
+        await self._prepare_agentenv_template_compat(sandbox_state)
+
+        # 4) Always: make xlsx saves silent so the agent's formatting persists (see
         #    _SAVE_CONFIG_SCRIPT). Independent of the OOD popup/window prep below.
         if self.config.save_config_fix:
             try:
@@ -529,7 +825,7 @@ class OSWorldResourcesServer(SimpleResourcesServer):
             except Exception as e:  # noqa: BLE001 - best-effort; never fail the rollout
                 logger.warning("Could not apply save-config (proceeding): %r", e)
 
-        # 4) Optional (default off, OOD): silence focus-stealers / popups.
+        # 5) Optional (default off, OOD): silence focus-stealers / popups.
         if self.config.prepare_guest_environment:
             await self._prepare_guest_environment(sandbox_state)
 
@@ -577,11 +873,12 @@ class OSWorldResourcesServer(SimpleResourcesServer):
         timeout_s: float = 900.0,
     ) -> Dict[str, Any]:
         """Run one ``eval_task.py`` phase; returns the parsed sentinel dict."""
-        os.makedirs(self.config.cache_dir, exist_ok=True)
+        task_cache_dir = _sandbox_eval_cache_dir(self.config.cache_dir, sandbox_state)
+        os.makedirs(task_cache_dir, exist_ok=True)
         screen = sandbox_state.get("screen") or {"width": 1920, "height": 1080}
         fd, cfg_path = tempfile.mkstemp(suffix=".json", prefix=f"osw_{phase}_")
         with os.fdopen(fd, "w") as f:
-            json.dump(_sanitize_setup_config(task_config) if phase == "setup" else task_config, f)
+            json.dump(_sanitize_setup_config(task_config), f)
         headers_fd, headers_path = tempfile.mkstemp(suffix=".json", prefix="osw_headers_")
         os.chmod(headers_path, 0o600)
         with os.fdopen(headers_fd, "w") as f:
@@ -605,7 +902,7 @@ class OSWorldResourcesServer(SimpleResourcesServer):
                 "--headers-file",
                 headers_path,
                 "--cache",
-                self.config.cache_dir,
+                task_cache_dir,
                 "--action-history",
                 json.dumps(action_history or []),
                 "--screen-w",
@@ -696,7 +993,7 @@ class OSWorldResourcesServer(SimpleResourcesServer):
         for attempt in range(attempts):
             sandbox_state: Optional[dict] = None
             try:
-                sandbox_state = await self._allocate_sandbox()
+                sandbox_state = await self._allocate_sandbox_with_retry()
                 logger.info(
                     "Allocated OSWorld sandbox %s (attempt %d/%d)",
                     sandbox_state["sandbox_id"],
@@ -852,7 +1149,11 @@ class OSWorldResourcesServer(SimpleResourcesServer):
             await self._release(previous)
         self.session_id_to_sandbox[session_id] = sandbox_state
         logger.info("Assigned OSWorld sandbox %s to session %s", sandbox_state["sandbox_id"], session_id)
-        return OSWorldSeedSessionResponse(sandbox_id=sandbox_state["sandbox_id"], screen=sandbox_state.get("screen"))
+        return OSWorldSeedSessionResponse(
+            sandbox_id=sandbox_state["sandbox_id"],
+            screen=sandbox_state.get("screen"),
+            template=sandbox_state.get("template"),
+        )
 
     async def screenshot(self, request: Request) -> ScreenshotResponse:
         sandbox_state = self._get_session_sandbox(request)

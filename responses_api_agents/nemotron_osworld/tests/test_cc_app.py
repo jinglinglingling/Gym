@@ -14,12 +14,17 @@ from fastapi import Request
 from omegaconf import OmegaConf
 
 from nemo_gym.context_management.client import PARENT_HEADER
+from nemo_gym.context_management.history import SemanticHistory
+from nemo_gym.context_management.materialization import materialize_history_view
 from nemo_gym.server_utils import ServerClient
 from responses_api_agents.nemotron_osworld import cc_app
 from responses_api_agents.nemotron_osworld.cc_app import (
     NemotronOSWorldCCAgent,
     NemotronOSWorldCCAgentConfig,
     NemotronOSWorldCCRunRequest,
+)
+from responses_api_agents.nemotron_osworld.rfc0040_policy import (
+    RFC0040ImageHistoryPolicy,
 )
 from responses_api_models.vllm_model.app import VLLMModelConfig
 
@@ -161,6 +166,48 @@ def test_normalize_vendor_parser_input_preserves_explicit_action() -> None:
     }
 
     assert cc_app._normalize_vendor_parser_input(response) is response
+
+
+def test_rfc0015_observations_match_canonical_wire_contract() -> None:
+    opening = cc_app._rfc0015_observation("first", instruction="edit the file")
+    assert opening.content[0].text == "Task: edit the file\n"
+    assert opening.content[1].image_url == "data:image/png;base64,first"
+
+    followup = cc_app._rfc0015_observation(
+        "second",
+        execution_feedback_text="<tool_response>feedback</tool_response>",
+    )
+    assert followup.content[0].text == (
+        "Computer observation:\n"
+        "<tool_response>feedback</tool_response>\n"
+        "<tool_response>\n"
+    )
+    assert followup.content[1].image_url == "data:image/png;base64,second"
+    assert followup.content[2].text == "\n</tool_response>"
+
+
+def test_rfc0040_k8_s3_policy_pins_initial_and_rewrites_each_omitted_image() -> None:
+    history = SemanticHistory("dispatch_g0")
+    for index in range(17):
+        history.append_items(
+            [cc_app._rfc0015_observation(str(index), instruction="task" if index == 0 else None)],
+            turn_id=index,
+            is_initial_context=index == 0,
+            conditions_action_turn=index + 1,
+        )
+    policy = RFC0040ImageHistoryPolicy({"block_k": 8, "boundary_s": 3})
+    view = materialize_history_view(history, policy.plan(history, decision_turn=17))
+
+    assert len(view.media_ids) == 4
+    assert view.media_ids[0] == history.parts[1][1].media_id
+    assert len(view.decision.inserted_artifact_ids) == 13
+    marker_count = sum(
+        part.get("text") == "[Image omitted for text cleaning]"
+        for item in view.items
+        for part in item.get("content", [])
+        if isinstance(part, dict)
+    )
+    assert marker_count == 13
 
 
 def _config(**overrides: Any) -> NemotronOSWorldCCAgentConfig:
@@ -481,6 +528,50 @@ async def test_later_model_transport_failure_preserves_selected_trace_as_local_f
     assert model_calls == 2
     assert result.context_compaction_result.outcome == "execution_failure"
     assert result.instance_config["mask_sample"] is True
+    verify = next(call for call in transport.calls if call["url_path"] == "/verify")
+    assert verify["json"]["action_history"] == ["pyautogui.click(1, 2)", "FAIL"]
+    assert sum(call["url_path"] == "/release" for call in transport.calls) == 1
+
+
+async def test_later_context_guard_rejection_preserves_trainable_selected_trace(
+    monkeypatch,
+):
+    monkeypatch.setattr(cc_app, "_nemotron_contract", _fake_contract)
+    transport = _RunClient()
+    original_post = transport.post
+    measurements = 0
+
+    async def reject_second_generation(**kwargs):
+        nonlocal measurements
+        if kwargs["url_path"].endswith("/measure"):
+            measurements += 1
+            return _HTTPResponse({"prompt_token_count": 10 if measurements == 1 else 200})
+        return await original_post(**kwargs)
+
+    transport.post = reject_second_generation
+    result = await _agent(
+        transport,
+        context_history={
+            "enabled": True,
+            "policy": {
+                "type": "recency",
+                "config": {
+                    "images": {
+                        "enabled": True,
+                        "protect_initial_context": False,
+                        "keep_last_groups": 1,
+                    }
+                },
+            },
+            "schedule": {"type": "turn_chunked_recency", "actions_per_chunk": 2},
+            "guards": {"max_total_tokens": 100},
+        },
+    ).run(_request(), _body())
+
+    assert measurements == 2
+    assert sum(call["url_path"].endswith("/v1/responses") for call in transport.calls) == 1
+    assert result.context_compaction_result.outcome == "max_output_tokens"
+    assert result.instance_config.get("mask_sample") is not True
     verify = next(call for call in transport.calls if call["url_path"] == "/verify")
     assert verify["json"]["action_history"] == ["pyautogui.click(1, 2)", "FAIL"]
     assert sum(call["url_path"] == "/release" for call in transport.calls) == 1

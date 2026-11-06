@@ -33,10 +33,14 @@ executes the returned pyautogui snippets via ``/execute`` with the exact
 
 import asyncio
 import base64
+import hashlib
+import importlib.util
 import json
 import logging
 import os
+import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from aiohttp import ClientTimeout
@@ -92,6 +96,19 @@ class NemotronOSWorldAgentConfig(BaseResponsesAPIAgentConfig):
     # The reference runner's env.step pause (sleep_after_execution); WAIT sleeps the same.
     sleep_after_execution_s: float = 5.0
     llm_timeout_s: float = Field(default=1200.0, gt=0)
+    rollout_timeout_s: float = Field(default=3600.0, gt=0)
+    bound_model_calls_by_rollout_deadline: bool = False
+    action_timeout_s: float = Field(default=60.0, gt=0)
+    model_retries: int = Field(default=1, ge=1)
+    model_retry_backoff_s: float = Field(default=2.0, ge=0)
+    prompt_format_variant: Optional[str] = None
+    prompt_mode: str = "hf_tools"
+    execution_feedback: bool = False
+    image_block_k: int = Field(default=0, ge=0)
+    image_boundary_s: int = Field(default=0, ge=0)
+    canonical_harness_root: str = ""
+    canonical_agent_sha256: str = ""
+    canonical_feedback_sha256: str = ""
     # Debug aid: when set, save each step's observed screenshot + the parsed actions under
     # <dir>/<task_id8>/ so failing trajectories can be replayed visually. OFF for real gates.
     debug_trajectory_dir: str = ""
@@ -157,6 +174,8 @@ class NemotronOSWorldAgent(SimpleResponsesAPIAgent):
     # through the cookie-scoped /action_history endpoint rather than its own session.
     session_id_to_action_history: Dict[str, List[str]] = Field(default_factory=dict)
     _rollout_semaphore: Optional[asyncio.Semaphore] = PrivateAttr(default=None)
+    _canonical_agent_module: Any = PrivateAttr(default=None)
+    _canonical_feedback_module: Any = PrivateAttr(default=None)
 
     def setup_webserver(self):
         app = super().setup_webserver()
@@ -167,10 +186,65 @@ class NemotronOSWorldAgent(SimpleResponsesAPIAgent):
         session_id = request.session[SESSION_ID_KEY]
         return {"action_history": self.session_id_to_action_history.pop(session_id, [])}
 
+    @staticmethod
+    def _load_pinned_module(path: Path, module_name: str, expected_sha256: str) -> Any:
+        source = path.read_bytes()
+        actual_sha256 = hashlib.sha256(source).hexdigest()
+        if expected_sha256 and actual_sha256 != expected_sha256:
+            raise RuntimeError(
+                f"Canonical OSWorld source digest mismatch for {path}: "
+                f"expected {expected_sha256}, got {actual_sha256}"
+            )
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Could not load canonical OSWorld source: {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(module_name, None)
+            raise
+        logger.info("Loaded canonical OSWorld source %s (sha256=%s)", path, actual_sha256)
+        return module
+
+    def _reference_agent_module(self) -> Any:
+        if not self.config.canonical_harness_root:
+            from mm_agents.nvidia import nemotron_agent  # noqa: PLC0415
+
+            return nemotron_agent
+        if self._canonical_agent_module is None:
+            path = (
+                Path(self.config.canonical_harness_root)
+                / "mm_agents"
+                / "nvidia"
+                / "nemotron_agent.py"
+            )
+            self._canonical_agent_module = self._load_pinned_module(
+                path,
+                "_nemo_gym_canonical_nemotron_agent",
+                self.config.canonical_agent_sha256,
+            )
+        return self._canonical_agent_module
+
+    def _feedback_module(self) -> Any:
+        if self._canonical_feedback_module is None:
+            if not self.config.canonical_harness_root:
+                raise RuntimeError("execution_feedback requires canonical_harness_root")
+            path = Path(self.config.canonical_harness_root) / "desktop_env" / "execution_feedback.py"
+            self._canonical_feedback_module = self._load_pinned_module(
+                path,
+                "_nemo_gym_canonical_execution_feedback",
+                self.config.canonical_feedback_sha256,
+            )
+        return self._canonical_feedback_module
+
     def _make_reference_agent(self) -> Any:
         """Build the reference NemotronAgent from the pinned fork (lazy import: the fork's
         dependency set is heavy and Linux-only, and unit tests stub this seam)."""
-        from mm_agents.nvidia.nemotron_agent import NemotronAgent  # noqa: PLC0415
+        if self.config.prompt_format_variant:
+            os.environ["NEMOTRON_OSWORLD_PROMPT_MODE"] = self.config.prompt_mode
+        NemotronAgent = self._reference_agent_module().NemotronAgent
 
         return NemotronAgent(
             model=self.config.model_name,
@@ -183,6 +257,7 @@ class NemotronOSWorldAgent(SimpleResponsesAPIAgent):
             coordinate_type=self.config.coordinate_type,
             password=self.config.client_password,
             thinking=self.config.thinking,
+            prompt_format_variant=self.config.prompt_format_variant,
         )
 
     def _bind_reference_model_transport(
@@ -198,36 +273,83 @@ class NemotronOSWorldAgent(SimpleResponsesAPIAgent):
         event_loop = asyncio.get_running_loop()
 
         async def call(payload: Dict[str, Any]) -> Dict[str, Any]:
-            model_response = await self.server_client.post(
-                server_name=self.config.model_server.name,
-                url_path=self.url_path_for_request("/v1/chat/completions", request),
-                json=payload,
-                cookies=model_cookies,
-                timeout=ClientTimeout(total=self.config.llm_timeout_s),
-                _retry=False,
-            )
-            await raise_for_status(model_response)
-            model_cookies.update(
-                {str(key): str(getattr(value, "value", value)) for key, value in model_response.cookies.items()}
-            )
-            response_payload = await get_response_json(model_response)
-            choices = response_payload.get("choices") or []
-            if len(choices) != 1 or choices[0].get("finish_reason") != "stop":
-                raise RuntimeError("Nemotron model response did not finish cleanly")
-            message = choices[0].get("message")
-            if not isinstance(message, dict):
-                raise RuntimeError("Nemotron model response has no chat message")
-            return message
+            last_error: Optional[BaseException] = None
+            for attempt in range(self.config.model_retries):
+                # The rollout deadline is otherwise only checked between steps, so
+                # eight retried model calls could outlive it by up to two hours.
+                deadline = getattr(agent, "_nemo_gym_rollout_deadline", None)
+                request_timeout_s = self.config.llm_timeout_s
+                if deadline is not None:
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0:
+                        break
+                    request_timeout_s = min(request_timeout_s, remaining_s)
+                try:
+                    model_response = await self.server_client.post(
+                        server_name=self.config.model_server.name,
+                        url_path=self.url_path_for_request("/v1/chat/completions", request),
+                        json=payload,
+                        cookies=model_cookies,
+                        timeout=ClientTimeout(total=request_timeout_s),
+                        _retry=False,
+                    )
+                    await raise_for_status(model_response)
+                    model_cookies.update(
+                        {
+                            str(key): str(getattr(value, "value", value))
+                            for key, value in model_response.cookies.items()
+                        }
+                    )
+                    response_payload = await get_response_json(model_response)
+                    choices = response_payload.get("choices") or []
+                    if len(choices) != 1 or choices[0].get("finish_reason") != "stop":
+                        raise RuntimeError("Nemotron model response did not finish cleanly")
+                    message = choices[0].get("message")
+                    if not isinstance(message, dict):
+                        raise RuntimeError("Nemotron model response has no chat message")
+                    # The NeMo RL endpoint can attach multi-megabyte token/routed-expert
+                    # metadata to the OpenAI message.  The canonical OSWorld agent only
+                    # consumes these three text fields; returning the transport metadata
+                    # would also make its per-step response logger emit gigabytes.
+                    return {
+                        key: message[key]
+                        for key in ("content", "reasoning_content", "reasoning")
+                        if key in message
+                    }
+                except Exception as error:  # noqa: BLE001 - canonical runner retries transport failures
+                    last_error = error
+                    if attempt + 1 < self.config.model_retries:
+                        await asyncio.sleep(
+                            min(30.0, self.config.model_retry_backoff_s * (attempt + 1))
+                        )
+            raise RuntimeError(
+                f"Nemotron model request failed after {self.config.model_retries} attempts"
+            ) from last_error
 
         def call_from_worker(payload: Dict[str, Any], _model: str) -> Dict[str, Any]:
             future = asyncio.run_coroutine_threadsafe(call(payload), event_loop)
             try:
-                return future.result(timeout=self.config.llm_timeout_s + 5.0)
+                return future.result(timeout=self.config.rollout_timeout_s + 5.0)
             except TimeoutError:
                 future.cancel()
                 raise
 
         agent.call_llm = call_from_worker
+
+    def _set_image_window(self, agent: Any) -> None:
+        """Apply RFC0040's exact K/S image rule before the next canonical-agent call."""
+        if self.config.image_block_k <= 0 or self.config.image_boundary_s <= 0:
+            return
+        observations = getattr(agent, "observations", ())
+        step_idx = len(observations)
+        if step_idx < self.config.image_block_k:
+            image_window_start = 0
+        else:
+            boundary = (step_idx // self.config.image_block_k) * self.config.image_block_k
+            image_window_start = max(1, boundary - (self.config.image_boundary_s - 1))
+        # The RFC0015 agent pins observation zero independently and retains this
+        # many observations in the post-initial contiguous image window.
+        agent.max_image_history_length = step_idx + 1 - image_window_start
 
     async def responses(
         self,
@@ -249,6 +371,11 @@ class NemotronOSWorldAgent(SimpleResponsesAPIAgent):
         action_history: List[str] = []
         output_items: List[dict] = []
         terminal = False
+        pending_feedback_text = ""
+        rollout_deadline = time.monotonic() + self.config.rollout_timeout_s
+        if self.config.bound_model_calls_by_rollout_deadline:
+            agent._nemo_gym_rollout_deadline = rollout_deadline
+        feedback_module = self._feedback_module() if self.config.execution_feedback else None
 
         debug_dir = None
         if self.config.debug_trajectory_dir:
@@ -256,23 +383,64 @@ class NemotronOSWorldAgent(SimpleResponsesAPIAgent):
             os.makedirs(debug_dir, exist_ok=True)
 
         for step_idx in range(self.config.max_steps):
+            remaining_s = rollout_deadline - time.monotonic()
+            if remaining_s <= 0:
+                logger.warning("OSWorld rollout timed out before step %d", step_idx + 1)
+                break
             # OBSERVE — fetch the current screenshot from the resources server.
             shot_resp = await self.server_client.post(
                 server_name=resources_name,
                 url_path="/screenshot",
                 cookies=resources_cookies,
+                timeout=ClientTimeout(total=remaining_s),
                 _retry=False,
             )
             await raise_for_status(shot_resp)
             resources_cookies.update(_cookie_values(shot_resp.cookies))
             shot_json = await get_response_json(shot_resp)
             obs = {"screenshot": base64.b64decode(shot_json["image_base64"])}
+            if pending_feedback_text:
+                obs["execution_feedback_batch_text"] = pending_feedback_text
 
             # THINK — the reference agent builds messages, calls the model server's
             # chat-completions endpoint through the ServerClient bridge, and parses
             # the free-text `## Action/## Code` contract (including parse recovery
             # and the internal force-FAIL at the step cap).
-            message, actions, _cot = await asyncio.to_thread(agent.predict, instruction, obs, step_idx=step_idx)
+            self._set_image_window(agent)
+            try:
+                message, actions, _cot = await asyncio.to_thread(
+                    agent.predict, instruction, obs, step_idx=step_idx
+                )
+            except RuntimeError as error:
+                if not str(error).startswith("Nemotron model request failed after"):
+                    raise
+                # Exhausting all model attempts (most commonly because the
+                # trajectory filled max_model_len) is a terminal rollout
+                # failure, not an infrastructure row to mask. Preserve a
+                # concrete assistant output and FAIL action so the official
+                # evaluator scores the current desktop state as the reference
+                # runner would, while the rest of the shard continues.
+                logger.warning(
+                    "OSWorld model retries exhausted at step %d; terminating rollout with FAIL",
+                    step_idx + 1,
+                )
+                action_history.append("FAIL")
+                output_items.append(
+                    {
+                        "id": f"msg_{step_idx + 1}",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "FAIL",
+                                "annotations": [],
+                            }
+                        ],
+                    }
+                )
+                break
             if debug_dir is not None:
                 with open(os.path.join(debug_dir, f"step_{step_idx:03d}.png"), "wb") as f:
                     f.write(obs["screenshot"])
@@ -291,10 +459,15 @@ class NemotronOSWorldAgent(SimpleResponsesAPIAgent):
             output_items.append(output_item)
 
             # ACT — execute each returned action with the reference runner's semantics.
+            execution_feedbacks = []
             for action in actions:
                 action_history.append(action)
                 if action == "WAIT":
                     await asyncio.sleep(self.config.sleep_after_execution_s)
+                    if self.config.execution_feedback:
+                        # DesktopEnv.step sleeps once for WAIT and once after every
+                        # action; preserve that historical feedback_v2 behavior.
+                        await asyncio.sleep(self.config.sleep_after_execution_s)
                     continue
                 if action in ("FAIL", "DONE"):
                     terminal = True
@@ -305,11 +478,29 @@ class NemotronOSWorldAgent(SimpleResponsesAPIAgent):
                     url_path="/execute",
                     json={"command": command, "shell": False},
                     cookies=resources_cookies,
+                    timeout=ClientTimeout(
+                        total=min(
+                            self.config.action_timeout_s,
+                            max(rollout_deadline - time.monotonic(), 0.001),
+                        )
+                    ),
                     _retry=False,
                 )
-                # Tool errors are non-fatal; keep the rollout going (just refresh cookies).
+                await raise_for_status(exec_resp)
                 resources_cookies.update(_cookie_values(exec_resp.cookies))
+                if feedback_module is not None:
+                    execution_feedbacks.append(
+                        feedback_module.normalize_execution_result(
+                            await get_response_json(exec_resp),
+                            model_command=action,
+                        )
+                    )
                 await asyncio.sleep(self.config.sleep_after_execution_s)
+            pending_feedback_text = (
+                feedback_module.render_feedback_batch(execution_feedbacks)
+                if feedback_module is not None and execution_feedbacks
+                else ""
+            )
             if terminal:
                 break
 
@@ -355,7 +546,25 @@ class NemotronOSWorldAgent(SimpleResponsesAPIAgent):
                     "created_at": time.time(),
                     "model": self.config.model_name,
                     "object": "response",
-                    "output": [],
+                    # NeMo RL still requires at least one assistant generation when
+                    # allow_token_free_results is enabled.  Keep this row explicitly
+                    # masked, but provide a minimal token-free message so one transient
+                    # sandbox/agent 500 cannot abort the entire evaluation shard.
+                    "output": [
+                        {
+                            "id": "msg_rollout_infra_failure",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "rollout_infra_failure",
+                                    "annotations": [],
+                                }
+                            ],
+                        }
+                    ],
                     "parallel_tool_calls": False,
                     "tool_choice": "none",
                     "tools": [],

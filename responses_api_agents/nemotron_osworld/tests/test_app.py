@@ -23,6 +23,7 @@ exercised without a cluster or model.
 
 import base64
 import json
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
 
@@ -91,6 +92,8 @@ class ScriptedReferenceAgent:
 
 
 class BridgedReferenceAgent:
+    last_message: Optional[Dict[str, Any]] = None
+
     def call_llm(self, payload: Dict[str, Any], model: str) -> Dict[str, Any]:
         del payload, model
         raise AssertionError("The Gym transport bridge was not installed")
@@ -107,6 +110,7 @@ class BridgedReferenceAgent:
             },
             "vllm_local",
         )
+        self.last_message = message
         return message, ["DONE"], {"code": "DONE"}
 
 
@@ -202,6 +206,32 @@ class TestResponsesLoop:
         history = client.post("/action_history", cookies=resp.cookies)
         assert history.json()["action_history"] == ["WAIT", "FAIL"]
 
+    def test_exhausted_model_retries_become_scored_fail(self, monkeypatch: MonkeyPatch) -> None:
+        server = NemotronOSWorldAgent(
+            config=_make_config(), server_client=MagicMock(spec=ServerClient)
+        )
+        server.server_client = FakeServerClient(_resources_routes([]))
+
+        class ExhaustedAgent:
+            def reset(self, _logger=None) -> None:
+                del _logger
+
+            def predict(self, *_args, **_kwargs):
+                raise RuntimeError("Nemotron model request failed after 8 attempts")
+
+        monkeypatch.setattr(server, "_make_reference_agent", ExhaustedAgent)
+
+        client = _client(server)
+        response = client.post(
+            "/v1/responses",
+            json={"input": [{"role": "user", "content": "long task"}]},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["output"][0]["content"][0]["text"] == "FAIL"
+        history = client.post("/action_history", cookies=response.cookies)
+        assert history.json()["action_history"] == ["FAIL"]
+
     def test_step_cap_bounds_the_loop(self, monkeypatch: MonkeyPatch) -> None:
         server = NemotronOSWorldAgent(config=_make_config(max_steps=3), server_client=MagicMock(spec=ServerClient))
         exec_log: List[Any] = []
@@ -225,20 +255,29 @@ class TestResponsesLoop:
             "choices": [
                 {
                     "finish_reason": "stop",
-                    "message": {"role": "assistant", "content": "## Action: terminate"},
+                    "message": {
+                        "role": "assistant",
+                        "content": "## Action: terminate",
+                        "reasoning_content": "done",
+                        "routed_experts": ["unused"] * 100,
+                        "token_ids": list(range(100)),
+                    },
                 }
             ]
         }
         fake_client = FakeServerClient(routes)
         server.server_client = fake_client
-        monkeypatch.setattr(server, "_make_reference_agent", BridgedReferenceAgent)
+        bridged_agent = BridgedReferenceAgent()
+        monkeypatch.setattr(server, "_make_reference_agent", lambda: bridged_agent)
 
         client = _client(server)
         resp = client.post("/v1/responses", json={"input": [{"role": "user", "content": "do the task"}]})
 
         assert resp.status_code == 200
         output_item = resp.json()["output"][0]
-        assert output_item["content"][0]["text"] == "## Action: terminate"
+        assert output_item["content"][0]["text"] == (
+            "<think>done</think>\n## Action: terminate"
+        )
         for legacy_field in (
             "prompt_token_ids",
             "generation_token_ids",
@@ -249,6 +288,76 @@ class TestResponsesLoop:
         model_call = next(call for call in fake_client.calls if call["server"] == "policy_model")
         assert model_call["path"] == "/v1/chat/completions"
         assert model_call["_retry"] is False
+        assert bridged_agent.last_message == {
+            "content": "## Action: terminate",
+            "reasoning_content": "done",
+        }
+
+    def test_feedback_v2_is_attached_to_the_next_observation(self, monkeypatch: MonkeyPatch) -> None:
+        server = NemotronOSWorldAgent(
+            config=_make_config(execution_feedback=True, canonical_harness_root="/unused"),
+            server_client=MagicMock(spec=ServerClient),
+        )
+        server.server_client = FakeServerClient(_resources_routes([]))
+
+        class RecordingAgent(ScriptedReferenceAgent):
+            def __init__(self) -> None:
+                super().__init__(
+                    [
+                        ({"content": "click"}, ["pyautogui.click(10, 20)"]),
+                        ({"content": "done"}, ["DONE"]),
+                    ]
+                )
+                self.seen_observations: List[Dict[str, Any]] = []
+
+            def predict(self, instruction: str, obs: Dict, **kwargs: Any) -> tuple:
+                self.seen_observations.append(dict(obs))
+                return super().predict(instruction, obs, **kwargs)
+
+        recording_agent = RecordingAgent()
+        fake_feedback = SimpleNamespace(
+            normalize_execution_result=lambda result, model_command: {
+                "result": result,
+                "model_command": model_command,
+            },
+            render_feedback_batch=lambda feedbacks: f"<tool_response>{feedbacks!r}</tool_response>",
+        )
+        monkeypatch.setattr(server, "_make_reference_agent", lambda: recording_agent)
+        monkeypatch.setattr(server, "_feedback_module", lambda: fake_feedback)
+
+        response = _client(server).post(
+            "/v1/responses",
+            json={"input": [{"role": "user", "content": "click then finish"}]},
+        )
+
+        assert response.status_code == 200
+        assert "execution_feedback_batch_text" not in recording_agent.seen_observations[0]
+        assert recording_agent.seen_observations[1]["execution_feedback_batch_text"].startswith(
+            "<tool_response>"
+        )
+        assert "pyautogui.click(10, 20)" in recording_agent.seen_observations[1][
+            "execution_feedback_batch_text"
+        ]
+
+    def test_exact_k8_s3_window_matches_rfc0040_boundaries(self) -> None:
+        server = NemotronOSWorldAgent(
+            config=_make_config(image_block_k=8, image_boundary_s=3),
+            server_client=MagicMock(spec=ServerClient),
+        )
+        agent = SimpleNamespace(observations=[])
+
+        expected = {
+            0: 1,
+            7: 8,
+            8: 3,
+            9: 4,
+            15: 10,
+            16: 3,
+        }
+        for completed_steps, max_image_history_length in expected.items():
+            agent.observations = [object()] * completed_steps
+            server._set_image_window(agent)
+            assert agent.max_image_history_length == max_image_history_length
 
 
 class TestRun:
@@ -312,6 +421,10 @@ class TestRun:
         assert payload["reward"] == 0.0
         assert payload["verify_error"].startswith("rollout_infra_failure")
         assert payload["instance_config"]["mask_sample"] is True
+        assert (
+            payload["response"]["output"][0]["content"][0]["text"]
+            == "rollout_infra_failure"
+        )
 
     def test_run_releases_sandbox_when_rollout_fails_after_seed(self) -> None:
         """A failure after a successful seed uses idempotent cleanup with its resource cookie."""

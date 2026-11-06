@@ -26,6 +26,7 @@ from nemo_gym.context_management import (
     ContextManagedResponsesClient,
     LogicalCCResult,
 )
+from nemo_gym.context_management.policies import register_history_policy
 from nemo_gym.context_management.result import capture_rollout_id
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
@@ -42,9 +43,17 @@ from responses_api_agents.nemotron_osworld.app import (
     NemotronOSWorldVerifyResponse,
     _extract_instruction,
 )
+from responses_api_agents.nemotron_osworld.rfc0040_policy import (
+    RFC0040ImageHistoryPolicy,
+)
 
 
 logger = logging.getLogger("nemo_gym.osworld.nemotron_cc_agent")
+register_history_policy(
+    RFC0040ImageHistoryPolicy.name,
+    RFC0040ImageHistoryPolicy,
+    replace_existing=True,
+)
 
 
 class NemotronOSWorldCCAgentConfig(NemotronOSWorldAgentConfig):
@@ -79,21 +88,17 @@ class _EpisodeResult:
     model_cookies: dict[str, str]
 
 
-def _nemotron_contract() -> tuple[str, str, str, Any]:
+def _nemotron_contract(module: Any = None) -> tuple[str, str, str, Any]:
     """Load the validated prompt constants and parser from the pinned OSWorld package."""
 
-    from mm_agents.nvidia.nemotron_agent import (  # noqa: PLC0415
-        INSTRUCTION_TEMPLATE,
-        SYSTEM_PROMPT_NON_THINKING,
-        SYSTEM_PROMPT_THINKING,
-        parse_response_to_cot_and_action,
-    )
+    if module is None:
+        from mm_agents.nvidia import nemotron_agent as module  # noqa: PLC0415
 
     return (
-        SYSTEM_PROMPT_THINKING,
-        SYSTEM_PROMPT_NON_THINKING,
-        INSTRUCTION_TEMPLATE,
-        parse_response_to_cot_and_action,
+        module.SYSTEM_PROMPT_THINKING,
+        module.SYSTEM_PROMPT_NON_THINKING,
+        module.INSTRUCTION_TEMPLATE,
+        module.parse_response_to_cot_and_action,
     )
 
 
@@ -178,6 +183,42 @@ def _screenshot_observation(image_base64: str, text: str) -> NeMoGymEasyInputMes
     )
 
 
+def _rfc0015_observation(
+    image_base64: str,
+    *,
+    instruction: str | None = None,
+    execution_feedback_text: str = "",
+) -> NeMoGymEasyInputMessage:
+    """Render the pinned RFC0015 observation using Responses input-part names."""
+
+    if instruction is not None:
+        content = [
+            {"type": "input_text", "text": f"Task: {instruction}\n"},
+            {
+                "type": "input_image",
+                "image_url": f"data:image/png;base64,{image_base64}",
+                "detail": "auto",
+            },
+        ]
+    else:
+        feedback = execution_feedback_text.strip()
+        prefix = (
+            f"Computer observation:\n{feedback}\n<tool_response>\n"
+            if feedback
+            else 'Computer observation:\n<tool_response>\nresult:\n{"status": "unknown"}\n'
+        )
+        content = [
+            {"type": "input_text", "text": prefix},
+            {
+                "type": "input_image",
+                "image_url": f"data:image/png;base64,{image_base64}",
+                "detail": "auto",
+            },
+            {"type": "input_text", "text": "\n</tool_response>"},
+        ]
+    return NeMoGymEasyInputMessage(role="user", content=content)
+
+
 def _without_raw_images(items: list[dict[str, Any]] | str) -> list[dict[str, Any]] | str:
     """Project response echoes after verification; the receipt owns each media asset once."""
 
@@ -240,12 +281,25 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
         if not instruction:
             raise RuntimeError("Nemotron OSWorld request has no task instruction")
 
-        thinking_prompt, non_thinking_prompt, instruction_template, parser = _nemotron_contract()
+        contract_module = (
+            self._reference_agent_module()
+            if self.config.canonical_harness_root
+            else None
+        )
+        thinking_prompt, non_thinking_prompt, instruction_template, parser = _nemotron_contract(
+            contract_module
+        )
         system_prompt = (thinking_prompt if self.config.thinking else non_thinking_prompt).replace(
             "{password}", self.config.client_password
         )
         instruction_prompt = instruction_template.format(instruction=instruction)
         model_request = self._model_request(body, system_prompt=system_prompt)
+        exact_rfc0015 = self.config.prompt_format_variant == "rfc0015_v1"
+        feedback_module = (
+            self._feedback_module()
+            if exact_rfc0015 and self.config.execution_feedback
+            else None
+        )
 
         resources_name = self.config.resources_server.name
         resource_cookie_values = _cookie_values(resources_cookies)
@@ -256,6 +310,7 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
         outcome = "completed"
         model_call_failed_after_selection = False
         rollout_started_at = time.monotonic()
+        pending_feedback_text = ""
 
         debug_dir = None
         if self.config.debug_trajectory_dir:
@@ -307,9 +362,17 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
                 outcome = "execution_failure"
                 break
 
-            observation = _screenshot_observation(
-                image_base64,
-                instruction_prompt + f"You are currently on Step {step_idx + 1}.\n",
+            observation = (
+                _rfc0015_observation(
+                    image_base64,
+                    instruction=instruction if step_idx == 0 else None,
+                    execution_feedback_text=pending_feedback_text,
+                )
+                if exact_rfc0015
+                else _screenshot_observation(
+                    image_base64,
+                    instruction_prompt + f"You are currently on Step {step_idx + 1}.\n",
+                )
             )
             if client is None:
                 opening_request = NeMoGymResponseCreateParamsNonStreaming.model_validate(
@@ -322,6 +385,8 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
                     config=self.config.context_history,
                     initial_request=opening_request,
                     token_capture=self._token_id_capture_enabled(),
+                    # RFC0015 affects model-visible task observations and feedback only.
+                    # Keep NeMo Gym's native response.output history and lineage contract.
                 )
             else:
                 client.append_observation([observation])
@@ -341,10 +406,22 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
                 model_call_failed_after_selection = True
                 break
             except ContextGuardRejected:
-                logger.warning("OSWorld context guard rejected step %d", step_idx + 1)
-                # The shared client closes after any failed generation admission.
-                # Returning a partial receipt would falsely attest a terminal action.
-                raise
+                if last_response is None:
+                    raise
+                logger.warning(
+                    "OSWorld context guard rejected step %d; preserving the last selected trace as a "
+                    "trainable context-limit rollout",
+                    step_idx + 1,
+                )
+                action_history.append("FAIL")
+                # The guard rejects before dispatching the next model call, so the
+                # previously acknowledged token-capture chain is complete and safe
+                # to train. Treat this like a length-limited policy trajectory, not
+                # infrastructure loss: masking all N generations for one long task
+                # would otherwise drop the prompt group and shrink a strict batch.
+                outcome = "max_output_tokens"
+                model_call_failed_after_selection = True
+                break
             except Exception:
                 if last_response is None:
                     raise
@@ -373,7 +450,7 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
                 )
                 break
 
-            parser_input = _normalize_vendor_parser_input(_extract_model_text(current_response.output))
+            parser_input = _extract_model_text(current_response.output)
             try:
                 low_level_instruction, actions, cot = parser(
                     parser_input,
@@ -416,6 +493,7 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
                         + "\n"
                     )
 
+            execution_feedbacks = []
             for action in actions:
                 action_history.append(action)
                 if action == "WAIT":
@@ -424,6 +502,11 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
                             asyncio.sleep(self.config.sleep_after_execution_s),
                             timeout=max(time_left(), 0.001),
                         )
+                        if feedback_module is not None:
+                            await asyncio.wait_for(
+                                asyncio.sleep(self.config.sleep_after_execution_s),
+                                timeout=max(time_left(), 0.001),
+                            )
                     except TimeoutError:
                         action_history.append("FAIL")
                         outcome = "execution_failure"
@@ -449,6 +532,14 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
                         _retry=False,
                     )
                     resource_cookie_values.update(_cookie_values(execute_response.cookies))
+                    await raise_for_status(execute_response)
+                    if feedback_module is not None:
+                        execution_feedbacks.append(
+                            feedback_module.normalize_execution_result(
+                                await get_response_json(execute_response),
+                                model_command=action,
+                            )
+                        )
                     await asyncio.wait_for(
                         asyncio.sleep(self.config.sleep_after_execution_s),
                         timeout=max(time_left(), 0.001),
@@ -461,6 +552,11 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
                     outcome = "execution_failure"
                     terminal = True
                     break
+            pending_feedback_text = (
+                feedback_module.render_feedback_batch(execution_feedbacks)
+                if feedback_module is not None and execution_feedbacks
+                else ""
+            )
             if terminal:
                 if outcome == "max_steps":
                     break
@@ -526,6 +622,7 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
     ) -> NemotronOSWorldCCVerifyResponse:
         cookies = _cookie_values(request.cookies)
         seeded = False
+        sandbox_template: str | None = None
         episode: _EpisodeResult | None = None
         try:
             seed_response = await self.server_client.post(
@@ -538,6 +635,8 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
             )
             await raise_for_status(seed_response)
             cookies.update(_cookie_values(seed_response.cookies))
+            seed_payload = await get_response_json(seed_response)
+            sandbox_template = seed_payload.get("template")
             seeded = True
 
             episode = await self._create_episode(
@@ -572,6 +671,8 @@ class NemotronOSWorldCCAgent(NemotronOSWorldAgent):
             request_echo = dict(verified["responses_create_params"])
             request_echo["input"] = _without_raw_images(request_echo["input"])
             instance_config = dict(verified.get("instance_config") or {})
+            if sandbox_template:
+                instance_config["agentenv_template"] = sandbox_template
             if episode.context_compaction_result.outcome == "execution_failure" or verified.get("verify_error"):
                 instance_config["mask_sample"] = True
             return NemotronOSWorldCCVerifyResponse.model_validate(
