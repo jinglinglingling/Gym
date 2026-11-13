@@ -48,6 +48,11 @@ class AgentEnvConnectionConfig:
 class AgentEnvCreateConfig:
     template: str = "osworld-slim"
     timeout_s: int = 7200
+    # False kills sandboxes at TTL; True pauses them, and AgentEnv never evicts paused sandboxes.
+    auto_resume: bool = False
+
+    def lifecycle_body(self) -> dict[str, Any]:
+        return {"autoPause": self.auto_resume, "autoResume": {"enabled": self.auto_resume}}
 
     def __post_init__(self) -> None:
         if not self.template.strip():
@@ -163,7 +168,7 @@ class AgentEnvProvider:
             response = await self._request(
                 "POST",
                 "/sandboxes",
-                json={"templateID": template, "timeout": int(ttl_s)},
+                json={"templateID": template, "timeout": int(ttl_s), **self._create.lifecycle_body()},
             )
             sandbox_id = str(response.json()["sandboxID"])
         except Exception as exc:
@@ -195,7 +200,7 @@ class AgentEnvProvider:
         response = await self._request(
             "POST",
             f"/sandboxes/{handle.sandbox_id}/fork",
-            json={"count": count, "timeout": int(effective_ttl)},
+            json={"count": count, "timeout": int(effective_ttl), **self._create.lifecycle_body()},
         )
         payload = response.json()
         if not isinstance(payload, list) or len(payload) != count:

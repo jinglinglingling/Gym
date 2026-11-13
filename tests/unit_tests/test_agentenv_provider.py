@@ -27,10 +27,20 @@ async def test_agentenv_create_endpoint_fork_and_close() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.method == "POST" and request.url.path == "/sandboxes":
-            assert json.loads(request.content) == {"templateID": "osworld-template", "timeout": 600}
+            assert json.loads(request.content) == {
+                "templateID": "osworld-template",
+                "timeout": 600,
+                "autoPause": False,
+                "autoResume": {"enabled": False},
+            }
             return httpx.Response(201, json={"sandboxID": "parent"})
         if request.method == "POST" and request.url.path == "/sandboxes/parent/fork":
-            assert json.loads(request.content) == {"count": 2, "timeout": 600}
+            assert json.loads(request.content) == {
+                "count": 2,
+                "timeout": 600,
+                "autoPause": False,
+                "autoResume": {"enabled": False},
+            }
             return httpx.Response(
                 201,
                 json=[

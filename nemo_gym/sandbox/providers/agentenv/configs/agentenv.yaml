@@ -11,6 +11,7 @@ sandbox:
     create:
       template: ${oc.env:AGENTENV_TEMPLATE,osworld-slim-pixel-parity-20261001}
       timeout_s: ${oc.decode:${oc.env:OSWORLD_SANDBOX_TTL_S,7200}}
+      auto_resume: false
 
 # Initialize each task once, then fork one sandbox for every active generation
 # so all logical owners start from exactly the same task state.
